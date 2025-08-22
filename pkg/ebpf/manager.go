@@ -104,16 +104,16 @@ func (m *Manager) HasProgram(name string) bool {
 // Close 关闭管理器并清理所有程序
 func (m *Manager) Close() error {
 	var errors []error
-	
+
 	for name, prog := range m.programs {
 		if err := prog.Close(); err != nil {
 			errors = append(errors, fmt.Errorf("failed to close program %s: %w", name, err))
 		}
 	}
-	
+
 	// 清空程序映射
 	m.programs = make(map[string]*Program)
-	
+
 	// 如果有错误，返回合并的错误信息
 	if len(errors) > 0 {
 		errorMsg := "multiple errors occurred while closing programs:"
@@ -122,7 +122,7 @@ func (m *Manager) Close() error {
 		}
 		return fmt.Errorf(errorMsg)
 	}
-	
+
 	return nil
 }
 
@@ -134,7 +134,7 @@ func (m *Manager) ReloadProgram(name string, spec *ProgramSpec) error {
 			return fmt.Errorf("failed to unload existing program %s: %w", name, err)
 		}
 	}
-	
+
 	// 加载新程序
 	return m.LoadProgram(name, spec)
 }
@@ -148,7 +148,7 @@ func (m *Manager) LoadProgramFromObject(name, objectFile, section, attachTo stri
 		Section:    section,
 		AttachTo:   attachTo,
 	}
-	
+
 	return m.LoadProgram(name, spec)
 }
 
@@ -158,6 +158,6 @@ func (m *Manager) GetProgramMap(programName, mapName string) (*ebpf.Map, error) 
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return prog.GetMap(mapName)
 }

@@ -17,7 +17,13 @@ GOMOD=$(GOCMD) mod
 
 # eBPF 相关变量
 CLANG=clang
-CLANG_FLAGS=-O2 -g -Wall -Werror -D__KERNEL__ -D__BPF_TRACING__ -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Wunused -Wall
+CLANG_FLAGS=-O2 -g -Wall -Werror \
+	-D__KERNEL__ -D__BPF_TRACING__ \
+	-Wno-unused-value -Wno-pointer-sign \
+	-Wno-compare-distinct-pointer-types \
+	-Wno-address-of-packed-member \
+	-I/usr/include \
+	-I/usr/include/$(shell uname -m)-linux-gnu
 
 # 构建目标
 build: build-ebpf
@@ -49,6 +55,53 @@ install-deps:
 	@echo "Installing Go dependencies..."
 	$(GOMOD) download
 	$(GOMOD) tidy
+
+# 安装系统依赖
+install-system-deps:
+	@echo "Installing system dependencies..."
+	@chmod +x scripts/install_deps.sh
+	@./scripts/install_deps.sh
+
+# 生成 bpf2go 代码
+generate-bpf:
+	@echo "Generating bpf2go code..."
+	cd pkg/ebpf && go generate ./...
+	@echo "✅ bpf2go code generated"
+
+# 构建 bpf2go 示例
+build-bpf2go: generate-bpf
+	@echo "Building bpf2go TC monitor example..."
+	@mkdir -p $(BUILD_DIR)
+	$(GOBUILD) -v -o $(BUILD_DIR)/tc_monitor_bpf2go examples/tc_monitor_example.go
+	@echo "✅ bpf2go example built"
+
+# 运行 bpf2go 示例
+run-bpf2go: build-bpf2go
+	@echo "Running bpf2go TC monitor example..."
+	@echo "Note: This requires root privileges to attach eBPF programs"
+	sudo $(BUILD_DIR)/tc_monitor_bpf2go eth0
+
+# 构建 eBPF 程序（简化版本）
+build-ebpf-simple:
+	@echo "Building eBPF programs (simple version)..."
+	@mkdir -p $(BUILD_DIR)/ebpf
+	@mkdir -p pkg/ebpf/objects
+	@echo "Compiling network monitor..."
+	$(CLANG) $(CLANG_FLAGS) -target bpf -c $(EBPF_DIR)/network/monitor.c -o $(BUILD_DIR)/ebpf/network-monitor.o
+	@echo "Copying objects for embedding..."
+	@cp $(BUILD_DIR)/ebpf/network-monitor.o pkg/ebpf/objects/
+	@touch pkg/ebpf/objects/security-monitor.o
+
+# 构建 eBPF 程序（最简版本，如果其他都失败）
+build-ebpf-minimal:
+	@echo "Building eBPF programs (minimal version)..."
+	@mkdir -p $(BUILD_DIR)/ebpf
+	@mkdir -p pkg/ebpf/objects
+	@echo "Compiling minimal network monitor..."
+	$(CLANG) -O2 -target bpf -c $(EBPF_DIR)/network/monitor_fixed.c -o $(BUILD_DIR)/ebpf/network-monitor.o
+	@echo "Copying objects for embedding..."
+	@cp $(BUILD_DIR)/ebpf/network-monitor.o pkg/ebpf/objects/
+	@touch pkg/ebpf/objects/security-monitor.o
 
 # 运行测试
 test:

@@ -1,15 +1,135 @@
-#include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
-#include <linux/in.h>
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_core_read.h>
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" --target=amd64 NetworkMonitor monitor.c
 
-// 包含 CO-RE 支持的 vmlinux.h (如果可用)
-// #include "vmlinux.h"  // 取消注释以使用 CO-RE
+// 网络监控 eBPF 程序
+// 支持 XDP 和 TC hook 点的网络流量监控
+
+// 基本类型定义
+typedef unsigned char __u8;
+typedef unsigned short __u16;
+typedef unsigned int __u32;
+typedef unsigned long long __u64;
+
+// BPF 程序类型
+#define BPF_PROG_TYPE_XDP 6
+#define BPF_PROG_TYPE_SCHED_CLS 3
+
+// BPF Map 类型
+#define BPF_MAP_TYPE_ARRAY 2
+#define BPF_MAP_TYPE_HASH 1
+
+// 网络协议常量 (网络字节序)
+#define ETH_P_IP_BE 0x0008  // 0x0800 in big-endian
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+
+// XDP 返回值
+#define XDP_PASS 2
+#define XDP_DROP 1
+
+// TC 返回值
+#define TC_ACT_OK 0
+#define TC_ACT_SHOT 2
+
+// 基本网络结构体
+struct ethhdr {
+    __u8  h_dest[6];
+    __u8  h_source[6];
+    __u16 h_proto;
+} __attribute__((packed));
+
+struct iphdr {
+    __u8  ihl:4,
+          version:4;
+    __u8  tos;
+    __u16 tot_len;
+    __u16 id;
+    __u16 frag_off;
+    __u8  ttl;
+    __u8  protocol;
+    __u16 check;
+    __u32 saddr;
+    __u32 daddr;
+} __attribute__((packed));
+
+struct tcphdr {
+    __u16 source;
+    __u16 dest;
+    __u32 seq;
+    __u32 ack_seq;
+    __u16 res1:4,
+          doff:4,
+          fin:1,
+          syn:1,
+          rst:1,
+          psh:1,
+          ack:1,
+          urg:1,
+          ece:1,
+          cwr:1;
+    __u16 window;
+    __u16 check;
+    __u16 urg_ptr;
+} __attribute__((packed));
+
+struct udphdr {
+    __u16 source;
+    __u16 dest;
+    __u16 len;
+    __u16 check;
+} __attribute__((packed));
+
+// BPF 上下文结构体
+struct xdp_md {
+    __u32 data;
+    __u32 data_end;
+    __u32 data_meta;
+    __u32 ingress_ifindex;
+    __u32 rx_queue_index;
+    __u32 egress_ifindex;
+};
+
+struct __sk_buff {
+    __u32 len;
+    __u32 pkt_type;
+    __u32 mark;
+    __u32 queue_mapping;
+    __u32 protocol;
+    __u32 vlan_present;
+    __u32 vlan_tci;
+    __u32 vlan_proto;
+    __u32 priority;
+    __u32 ingress_ifindex;
+    __u32 ifindex;
+    __u32 tc_index;
+    __u32 cb[5];
+    __u32 hash;
+    __u32 tc_classid;
+    __u32 data;
+    __u32 data_end;
+    __u32 napi_id;
+    __u32 family;
+    __u32 remote_ip4;
+    __u32 local_ip4;
+    __u32 remote_ip6[4];
+    __u32 local_ip6[4];
+    __u32 remote_port;
+    __u32 local_port;
+};
+
+// BPF 辅助函数声明
+static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
+static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
+//static __u64 (*bpf_ktime_get_ns)(void) = (void *) 5;
+//static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *) 131;
+//static long (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *) 132;
+
+// Map 定义宏
+#define SEC(name) __attribute__((section(name), used))
+
+// 字节序转换函数
+static inline __u16 bpf_ntohs(__u16 netshort) {
+    return (netshort >> 8) | (netshort << 8);
+}
 
 // 数据结构定义
 struct flow_key {
@@ -38,61 +158,36 @@ struct tc_device_key {
     __u32 stat_type;    // 统计类型 (packets/bytes)
 };
 
-// TC 详细事件信息
-struct tc_event {
-    __u64 timestamp;
-    __u32 ifindex;
-    __u32 direction;
-    __u32 len;
-    __u32 mark;
-    __u32 priority;
-    __u32 queue_mapping;
-    __u32 tc_classid;
-    __u8  pkt_type;
-    struct flow_key flow;
-};
-
 // eBPF Maps 定义
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 10);
-    __type(key, __u32);
-    __type(value, __u64);
-} packet_stats SEC(".maps");
+    __u32 type;
+    __u32 max_entries;
+    __u32 *key;
+    __u64 *value;
+} packet_stats SEC(".maps") = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .max_entries = 10,
+};
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, struct flow_key);
-    __type(value, __u64);
-} flow_stats SEC(".maps");
+    __u32 type;
+    __u32 max_entries;
+    struct flow_key *key;
+    __u64 *value;
+} flow_stats SEC(".maps") = {
+    .type = BPF_MAP_TYPE_HASH,
+    .max_entries = 10240,
+};
 
 struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24);
-} packet_events SEC(".maps");
-
-// TC 设备级统计 Map
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, struct tc_device_key);
-    __type(value, __u64);
-} tc_device_stats SEC(".maps");
-
-// TC 事件 RingBuf
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 23);
-} tc_events SEC(".maps");
-
-// 每设备的流量统计
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, struct flow_key);
-    __type(value, __u64);
-} tc_flow_stats SEC(".maps");
+    __u32 type;
+    __u32 max_entries;
+    struct tc_device_key *key;
+    __u64 *value;
+} tc_device_stats SEC(".maps") = {
+    .type = BPF_MAP_TYPE_HASH,
+    .max_entries = 1024,
+};
 
 // 统计键定义
 #define STAT_RX_PACKETS  0
@@ -108,36 +203,15 @@ struct {
 #define TC_DIRECTION_INGRESS  0
 #define TC_DIRECTION_EGRESS   1
 
-// 辅助函数：更新统计信息
+// 辅助函数：安全的统计更新
 static inline void update_stats(__u32 key, __u64 value) {
-    __u64 *stat = bpf_map_lookup_elem(&packet_stats, &key);
-    if (stat) {
+    void *stat_ptr = bpf_map_lookup_elem(&packet_stats, &key);
+    if (stat_ptr) {
+        __u64 *stat = (__u64 *)stat_ptr;
         __sync_fetch_and_add(stat, value);
     } else {
-        bpf_map_update_elem(&packet_stats, &key, &value, BPF_ANY);
+        bpf_map_update_elem(&packet_stats, &key, &value, 0);
     }
-}
-
-// 辅助函数：更新流量统计
-static inline void update_flow_stats(struct flow_key *key) {
-    __u64 *count = bpf_map_lookup_elem(&flow_stats, key);
-    if (count) {
-        __sync_fetch_and_add(count, 1);
-    } else {
-        __u64 initial_count = 1;
-        bpf_map_update_elem(&flow_stats, key, &initial_count, BPF_ANY);
-    }
-}
-
-// 辅助函数：发送包事件到用户空间
-static inline void send_packet_event(struct packet_info *info) {
-    struct packet_info *event = bpf_ringbuf_reserve(&packet_events, sizeof(*event), 0);
-    if (!event) {
-        return;
-    }
-    
-    *event = *info;
-    bpf_ringbuf_submit(event, 0);
 }
 
 // 辅助函数：更新 TC 设备统计
@@ -148,33 +222,24 @@ static inline void update_tc_device_stats(__u32 ifindex, __u32 direction, __u32 
         .stat_type = stat_type
     };
     
-    __u64 *stat = bpf_map_lookup_elem(&tc_device_stats, &key);
-    if (stat) {
+    void *stat_ptr = bpf_map_lookup_elem(&tc_device_stats, &key);
+    if (stat_ptr) {
+        __u64 *stat = (__u64 *)stat_ptr;
         __sync_fetch_and_add(stat, value);
     } else {
-        bpf_map_update_elem(&tc_device_stats, &key, &value, BPF_ANY);
+        bpf_map_update_elem(&tc_device_stats, &key, &value, 0);
     }
 }
 
-// 辅助函数：发送 TC 事件到用户空间
-static inline void send_tc_event(struct tc_event *event) {
-    struct tc_event *tc_evt = bpf_ringbuf_reserve(&tc_events, sizeof(*event), 0);
-    if (!tc_evt) {
-        return;
-    }
-    
-    *tc_evt = *event;
-    bpf_ringbuf_submit(tc_evt, 0);
-}
-
-// 辅助函数：更新 TC 流量统计
-static inline void update_tc_flow_stats(struct flow_key *key) {
-    __u64 *count = bpf_map_lookup_elem(&tc_flow_stats, key);
-    if (count) {
+// 辅助函数：更新流量统计
+static inline void update_flow_stats(struct flow_key *key) {
+    void *count_ptr = bpf_map_lookup_elem(&flow_stats, key);
+    if (count_ptr) {
+        __u64 *count = (__u64 *)count_ptr;
         __sync_fetch_and_add(count, 1);
     } else {
         __u64 initial_count = 1;
-        bpf_map_update_elem(&tc_flow_stats, key, &initial_count, BPF_ANY);
+        bpf_map_update_elem(&flow_stats, key, &initial_count, 0);
     }
 }
 
@@ -191,8 +256,8 @@ int network_monitor_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
     
-    // 只处理 IP 包
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+    // 检查是否为 IP 包
+    if (eth->h_proto != ETH_P_IP_BE) {
         return XDP_PASS;
     }
     
@@ -201,54 +266,36 @@ int network_monitor_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
     
-    // 准备流量键和包信息
+    // 准备流量键
     struct flow_key key = {};
-    struct packet_info info = {};
-    
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.proto = ip->protocol;
     
-    info.src_ip = ip->saddr;
-    info.dst_ip = ip->daddr;
-    info.proto = ip->protocol;
-    info.packet_size = bpf_ntohs(ip->tot_len);
-    info.timestamp = bpf_ktime_get_ns();
-    
-    // 处理 TCP 包
+    // 处理 TCP/UDP 端口
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
-        if ((void *)(tcp + 1) > data_end) {
-            return XDP_PASS;
+        if ((void *)(tcp + 1) <= data_end) {
+            key.src_port = tcp->source;
+            key.dst_port = tcp->dest;
         }
-        
-        key.src_port = tcp->source;
-        key.dst_port = tcp->dest;
-        info.src_port = bpf_ntohs(tcp->source);
-        info.dst_port = bpf_ntohs(tcp->dest);
-    }
-    // 处理 UDP 包
-    else if (ip->protocol == IPPROTO_UDP) {
+    } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)ip + (ip->ihl * 4);
-        if ((void *)(udp + 1) > data_end) {
-            return XDP_PASS;
+        if ((void *)(udp + 1) <= data_end) {
+            key.src_port = udp->source;
+            key.dst_port = udp->dest;
         }
-        
-        key.src_port = udp->source;
-        key.dst_port = udp->dest;
-        info.src_port = bpf_ntohs(udp->source);
-        info.dst_port = bpf_ntohs(udp->dest);
     }
+    
+    // 获取包长度
+    __u16 packet_len = bpf_ntohs(ip->tot_len);
     
     // 更新统计信息
     update_stats(STAT_RX_PACKETS, 1);
-    update_stats(STAT_RX_BYTES, info.packet_size);
+    update_stats(STAT_RX_BYTES, packet_len);
     
     // 更新流量统计
     update_flow_stats(&key);
-    
-    // 发送事件到用户空间
-    send_packet_event(&info);
     
     return XDP_PASS;
 }
@@ -266,8 +313,8 @@ int network_monitor_tc_egress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     
-    // 只处理 IP 包
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+    // 检查是否为 IP 包
+    if (eth->h_proto != ETH_P_IP_BE) {
         return TC_ACT_OK;
     }
     
@@ -276,67 +323,40 @@ int network_monitor_tc_egress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     
-    // 准备 TC 事件和流量键
-    struct tc_event event = {};
-    struct flow_key flow_key = {};
+    // 准备流量键
+    struct flow_key key = {};
+    key.src_ip = ip->saddr;
+    key.dst_ip = ip->daddr;
+    key.proto = ip->protocol;
     
-    // 填充基本信息
-    event.timestamp = bpf_ktime_get_ns();
-    event.ifindex = skb->ifindex;
-    event.direction = TC_DIRECTION_EGRESS;
-    event.len = skb->len;
-    event.mark = skb->mark;
-    event.priority = skb->priority;
-    event.queue_mapping = skb->queue_mapping;
-    event.tc_classid = skb->tc_classid;
-    event.pkt_type = skb->pkt_type;
-    
-    // 填充流量信息
-    flow_key.src_ip = ip->saddr;
-    flow_key.dst_ip = ip->daddr;
-    flow_key.proto = ip->protocol;
-    
-    event.flow.src_ip = ip->saddr;
-    event.flow.dst_ip = ip->daddr;
-    event.flow.proto = ip->protocol;
-    
-    // 处理 TCP 包
+    // 处理 TCP/UDP 端口
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
         if ((void *)(tcp + 1) <= data_end) {
-            flow_key.src_port = tcp->source;
-            flow_key.dst_port = tcp->dest;
-            event.flow.src_port = tcp->source;
-            event.flow.dst_port = tcp->dest;
+            key.src_port = tcp->source;
+            key.dst_port = tcp->dest;
         }
-    }
-    // 处理 UDP 包
-    else if (ip->protocol == IPPROTO_UDP) {
+    } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)ip + (ip->ihl * 4);
         if ((void *)(udp + 1) <= data_end) {
-            flow_key.src_port = udp->source;
-            flow_key.dst_port = udp->dest;
-            event.flow.src_port = udp->source;
-            event.flow.dst_port = udp->dest;
+            key.src_port = udp->source;
+            key.dst_port = udp->dest;
         }
     }
+    
+    // 获取包长度
+    __u16 packet_len = bpf_ntohs(ip->tot_len);
     
     // 更新全局统计
     update_stats(STAT_TX_PACKETS, 1);
-    update_stats(STAT_TX_BYTES, bpf_ntohs(ip->tot_len));
+    update_stats(STAT_TX_BYTES, packet_len);
     
     // 更新设备级 TC 统计
     update_tc_device_stats(skb->ifindex, TC_DIRECTION_EGRESS, TC_STAT_PACKETS, 1);
-    update_tc_device_stats(skb->ifindex, TC_DIRECTION_EGRESS, TC_STAT_BYTES, bpf_ntohs(ip->tot_len));
+    update_tc_device_stats(skb->ifindex, TC_DIRECTION_EGRESS, TC_STAT_BYTES, packet_len);
     
-    // 更新 TC 流量统计
-    update_tc_flow_stats(&flow_key);
-    
-    // 发送详细事件到用户空间 (可选，用于调试或详细分析)
-    // 注意：在生产环境中可能需要采样以减少开销
-    if ((event.timestamp & 0xFF) == 0) {  // 1/256 采样率
-        send_tc_event(&event);
-    }
+    // 更新流量统计
+    update_flow_stats(&key);
     
     return TC_ACT_OK;
 }
@@ -354,8 +374,8 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     
-    // 只处理 IP 包
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+    // 检查是否为 IP 包
+    if (eth->h_proto != ETH_P_IP_BE) {
         return TC_ACT_OK;
     }
     
@@ -364,62 +384,36 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     
-    // 准备 TC 事件和流量键
-    struct tc_event event = {};
-    struct flow_key flow_key = {};
+    // 准备流量键
+    struct flow_key key = {};
+    key.src_ip = ip->saddr;
+    key.dst_ip = ip->daddr;
+    key.proto = ip->protocol;
     
-    // 填充基本信息
-    event.timestamp = bpf_ktime_get_ns();
-    event.ifindex = skb->ifindex;
-    event.direction = TC_DIRECTION_INGRESS;
-    event.len = skb->len;
-    event.mark = skb->mark;
-    event.priority = skb->priority;
-    event.queue_mapping = skb->queue_mapping;
-    event.tc_classid = skb->tc_classid;
-    event.pkt_type = skb->pkt_type;
-    
-    // 填充流量信息
-    flow_key.src_ip = ip->saddr;
-    flow_key.dst_ip = ip->daddr;
-    flow_key.proto = ip->protocol;
-    
-    event.flow.src_ip = ip->saddr;
-    event.flow.dst_ip = ip->daddr;
-    event.flow.proto = ip->protocol;
-    
-    // 处理 TCP 包
+    // 处理 TCP/UDP 端口
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
         if ((void *)(tcp + 1) <= data_end) {
-            flow_key.src_port = tcp->source;
-            flow_key.dst_port = tcp->dest;
-            event.flow.src_port = tcp->source;
-            event.flow.dst_port = tcp->dest;
+            key.src_port = tcp->source;
+            key.dst_port = tcp->dest;
         }
-    }
-    // 处理 UDP 包
-    else if (ip->protocol == IPPROTO_UDP) {
+    } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void *)ip + (ip->ihl * 4);
         if ((void *)(udp + 1) <= data_end) {
-            flow_key.src_port = udp->source;
-            flow_key.dst_port = udp->dest;
-            event.flow.src_port = udp->source;
-            event.flow.dst_port = udp->dest;
+            key.src_port = udp->source;
+            key.dst_port = udp->dest;
         }
     }
+    
+    // 获取包长度
+    __u16 packet_len = bpf_ntohs(ip->tot_len);
     
     // 更新设备级 TC 统计
     update_tc_device_stats(skb->ifindex, TC_DIRECTION_INGRESS, TC_STAT_PACKETS, 1);
-    update_tc_device_stats(skb->ifindex, TC_DIRECTION_INGRESS, TC_STAT_BYTES, bpf_ntohs(ip->tot_len));
+    update_tc_device_stats(skb->ifindex, TC_DIRECTION_INGRESS, TC_STAT_BYTES, packet_len);
     
-    // 更新 TC 流量统计
-    update_tc_flow_stats(&flow_key);
-    
-    // 发送详细事件到用户空间 (采样)
-    if ((event.timestamp & 0xFF) == 0) {  // 1/256 采样率
-        send_tc_event(&event);
-    }
+    // 更新流量统计
+    update_flow_stats(&key);
     
     return TC_ACT_OK;
 }
