@@ -42,6 +42,10 @@ Thumbs.db
 *.o
 *.ll
 
+# eBPF embedded objects (generated, not source)
+pkg/ebpf/objects/network-monitor.o
+pkg/ebpf/objects/security-monitor.o
+
 # Kubernetes generated files
 *.yaml.bak
 *.yml.bak

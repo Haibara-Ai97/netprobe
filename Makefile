@@ -31,16 +31,18 @@ build: build-ebpf
 build-ebpf:
 	@echo "Building eBPF programs..."
 	@mkdir -p $(BUILD_DIR)/ebpf
-	@for dir in $(shell find $(EBPF_DIR) -type d -name "*.c" -exec dirname {} \;); do \
-		for file in $$dir/*.c; do \
-			if [ -f "$$file" ]; then \
-				output=$$(echo $$file | sed 's|$(EBPF_DIR)|$(BUILD_DIR)/ebpf|' | sed 's|\.c$$|.o|'); \
-				mkdir -p $$(dirname $$output); \
-				echo "Compiling $$file -> $$output"; \
-				$(CLANG) $(CLANG_FLAGS) -target bpf -c $$file -o $$output; \
-			fi \
-		done \
-	done
+	@mkdir -p pkg/ebpf/objects
+	@echo "Compiling network monitor..."
+	$(CLANG) $(CLANG_FLAGS) -target bpf -c $(EBPF_DIR)/network/monitor.c -o $(BUILD_DIR)/ebpf/network-monitor.o
+	@echo "Compiling security monitor..."
+	$(CLANG) $(CLANG_FLAGS) -target bpf -c $(EBPF_DIR)/security/monitor.c -o $(BUILD_DIR)/ebpf/security-monitor.o
+	@echo "Copying objects for embedding..."
+	@cp $(BUILD_DIR)/ebpf/network-monitor.o pkg/ebpf/objects/
+	@cp $(BUILD_DIR)/ebpf/security-monitor.o pkg/ebpf/objects/ || echo "Warning: security-monitor.o not found, creating placeholder"
+	@if [ ! -f pkg/ebpf/objects/security-monitor.o ]; then \
+		echo "Creating placeholder security monitor object..."; \
+		touch pkg/ebpf/objects/security-monitor.o; \
+	fi
 
 # 安装依赖
 install-deps:

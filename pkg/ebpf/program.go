@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 
 	"github.com/cilium/ebpf"
@@ -59,6 +60,12 @@ func NewProgram(spec *ProgramSpec) (*Program, error) {
 		maps:    make(map[string]*ebpf.Map),
 	}
 
+	// 加载相关的 Maps (如果需要)
+	if err := p.loadMaps(spec.ObjectFile); err != nil {
+		prog.Close()
+		return nil, fmt.Errorf("failed to load maps: %w", err)
+	}
+
 	// 附加程序到指定位置
 	if err := p.attach(); err != nil {
 		prog.Close()
@@ -66,6 +73,26 @@ func NewProgram(spec *ProgramSpec) (*Program, error) {
 	}
 
 	return p, nil
+}
+
+// loadMaps 从对象文件加载相关的 Maps
+func (p *Program) loadMaps(objectFile string) error {
+	// 从对象文件加载 Collection 规范
+	spec, err := ebpf.LoadCollectionSpec(objectFile)
+	if err != nil {
+		return fmt.Errorf("failed to load collection spec: %w", err)
+	}
+
+	// 为每个 Map 创建实例
+	for name, mapSpec := range spec.Maps {
+		m, err := ebpf.NewMap(mapSpec)
+		if err != nil {
+			return fmt.Errorf("failed to create map %s: %w", name, err)
+		}
+		p.maps[name] = m
+	}
+
+	return nil
 }
 
 // attach 将程序附加到指定位置
@@ -88,12 +115,18 @@ func (p *Program) attach() error {
 
 // attachXDP 附加 XDP 程序
 func (p *Program) attachXDP() error {
+	// AttachTo 应该是网络接口名称
+	iface, err := net.InterfaceByName(p.spec.AttachTo)
+	if err != nil {
+		return fmt.Errorf("failed to find interface %s: %w", p.spec.AttachTo, err)
+	}
+
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   p.program,
-		Interface: p.spec.AttachTo,
+		Interface: iface.Index,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to attach XDP program to %s: %w", p.spec.AttachTo, err)
 	}
 	p.link = l
 	return nil
@@ -110,7 +143,7 @@ func (p *Program) attachTC() error {
 func (p *Program) attachKprobe() error {
 	l, err := link.Kprobe(p.spec.AttachTo, p.program, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to attach kprobe to %s: %w", p.spec.AttachTo, err)
 	}
 	p.link = l
 	return nil
@@ -120,7 +153,7 @@ func (p *Program) attachKprobe() error {
 func (p *Program) attachKretprobe() error {
 	l, err := link.Kretprobe(p.spec.AttachTo, p.program, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to attach kretprobe to %s: %w", p.spec.AttachTo, err)
 	}
 	p.link = l
 	return nil
@@ -128,13 +161,13 @@ func (p *Program) attachKretprobe() error {
 
 // attachTracepoint 附加 tracepoint 程序
 func (p *Program) attachTracepoint() error {
-	l, err := link.Tracepoint(link.TracepointOptions{
-		Program: p.program,
-		Group:   "net", // 假设是网络相关的 tracepoint
-		Name:    p.spec.AttachTo,
-	})
+	// AttachTo 格式应该是 "group:name"，例如 "net:net_dev_queue"
+	group := "net" // 默认组
+	name := p.spec.AttachTo
+
+	l, err := link.Tracepoint(group, name, p.program, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to attach tracepoint %s:%s: %w", group, name, err)
 	}
 	p.link = l
 	return nil
@@ -155,21 +188,21 @@ func (p *Program) Close() error {
 	// 分离程序
 	if p.link != nil {
 		if err := p.link.Close(); err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("failed to close link: %w", err)
 		}
 	}
 
 	// 关闭 maps
-	for _, m := range p.maps {
+	for name, m := range p.maps {
 		if err := m.Close(); err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("failed to close map %s: %w", name, err)
 		}
 	}
 
 	// 关闭程序
 	if p.program != nil {
 		if err := p.program.Close(); err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("failed to close program: %w", err)
 		}
 	}
 
@@ -184,17 +217,17 @@ func loadProgramFromFile(objectFile, section string) (*ebpf.ProgramSpec, error) 
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	// 这里应该使用 cilium/ebpf 的 LoadCollectionSpec 来加载
-	// 现在先返回一个简单的规范作为占位符
-	spec := &ebpf.ProgramSpec{
-		Type:    ebpf.XDP,
-		License: "GPL",
-		// Instructions 应该从对象文件中读取
-		Instructions: ebpf.Instructions{
-			ebpf.Mov.Imm(ebpf.Reg0, 2), // XDP_PASS
-			ebpf.Return(),
-		},
+	// 从对象文件加载 Collection 规范
+	spec, err := ebpf.LoadCollectionSpec(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load collection spec from %s: %w", absPath, err)
 	}
 
-	return spec, nil
+	// 查找指定的程序段
+	progSpec, exists := spec.Programs[section]
+	if !exists {
+		return nil, fmt.Errorf("program section %s not found in %s", section, absPath)
+	}
+
+	return progSpec, nil
 }
