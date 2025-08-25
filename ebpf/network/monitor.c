@@ -1,137 +1,20 @@
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" --target=amd64 NetworkMonitor monitor.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I../include" --target=amd64 NetworkMonitor monitor.c
 
 // 网络监控 eBPF 程序
 // 支持 XDP 和 TC hook 点的网络流量监控
 
-// 基本类型定义
-typedef unsigned char __u8;
-typedef unsigned short __u16;
-typedef unsigned int __u32;
-typedef unsigned long long __u64;
+#include <linux/bpf.h>
+#include <linux/types.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/in.h>
+#include <linux/pkt_cls.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
-// BPF 程序类型
-#define BPF_PROG_TYPE_XDP 6
-#define BPF_PROG_TYPE_SCHED_CLS 3
-
-// BPF Map 类型
-#define BPF_MAP_TYPE_ARRAY 2
-#define BPF_MAP_TYPE_HASH 1
-
-// 网络协议常量 (网络字节序)
-#define ETH_P_IP_BE 0x0008  // 0x0800 in big-endian
-#define IPPROTO_TCP 6
-#define IPPROTO_UDP 17
-
-// XDP 返回值
-#define XDP_PASS 2
-#define XDP_DROP 1
-
-// TC 返回值
-#define TC_ACT_OK 0
-#define TC_ACT_SHOT 2
-
-// 基本网络结构体
-struct ethhdr {
-    __u8  h_dest[6];
-    __u8  h_source[6];
-    __u16 h_proto;
-} __attribute__((packed));
-
-struct iphdr {
-    __u8  ihl:4,
-          version:4;
-    __u8  tos;
-    __u16 tot_len;
-    __u16 id;
-    __u16 frag_off;
-    __u8  ttl;
-    __u8  protocol;
-    __u16 check;
-    __u32 saddr;
-    __u32 daddr;
-} __attribute__((packed));
-
-struct tcphdr {
-    __u16 source;
-    __u16 dest;
-    __u32 seq;
-    __u32 ack_seq;
-    __u16 res1:4,
-          doff:4,
-          fin:1,
-          syn:1,
-          rst:1,
-          psh:1,
-          ack:1,
-          urg:1,
-          ece:1,
-          cwr:1;
-    __u16 window;
-    __u16 check;
-    __u16 urg_ptr;
-} __attribute__((packed));
-
-struct udphdr {
-    __u16 source;
-    __u16 dest;
-    __u16 len;
-    __u16 check;
-} __attribute__((packed));
-
-// BPF 上下文结构体
-struct xdp_md {
-    __u32 data;
-    __u32 data_end;
-    __u32 data_meta;
-    __u32 ingress_ifindex;
-    __u32 rx_queue_index;
-    __u32 egress_ifindex;
-};
-
-struct __sk_buff {
-    __u32 len;
-    __u32 pkt_type;
-    __u32 mark;
-    __u32 queue_mapping;
-    __u32 protocol;
-    __u32 vlan_present;
-    __u32 vlan_tci;
-    __u32 vlan_proto;
-    __u32 priority;
-    __u32 ingress_ifindex;
-    __u32 ifindex;
-    __u32 tc_index;
-    __u32 cb[5];
-    __u32 hash;
-    __u32 tc_classid;
-    __u32 data;
-    __u32 data_end;
-    __u32 napi_id;
-    __u32 family;
-    __u32 remote_ip4;
-    __u32 local_ip4;
-    __u32 remote_ip6[4];
-    __u32 local_ip6[4];
-    __u32 remote_port;
-    __u32 local_port;
-};
-
-// BPF 辅助函数声明
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
-//static __u64 (*bpf_ktime_get_ns)(void) = (void *) 5;
-//static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) = (void *) 131;
-//static long (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *) 132;
-
-// Map 定义宏
-#define SEC(name) __attribute__((section(name), used))
-
-// 字节序转换函数
-static inline __u16 bpf_ntohs(__u16 netshort) {
-    return (netshort >> 8) | (netshort << 8);
-}
-
-// 数据结构定义
+// 自定义数据结构
 struct flow_key {
     __u32 src_ip;
     __u32 dst_ip;
@@ -141,16 +24,6 @@ struct flow_key {
     __u8  pad[3];
 };
 
-struct packet_info {
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u8  proto;
-    __u16 packet_size;
-    __u64 timestamp;
-};
-
 // TC 设备统计键
 struct tc_device_key {
     __u32 ifindex;      // 网络设备索引
@@ -158,35 +31,27 @@ struct tc_device_key {
     __u32 stat_type;    // 统计类型 (packets/bytes)
 };
 
-struct bpf_map_def {
-    unsigned int type;
-    unsigned int key_size;
-    unsigned int value_size;
-    unsigned int max_entries;
-    unsigned int map_flags;
-};
+// eBPF Maps 定义
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10);
+} packet_stats SEC(".maps");
 
-// eBPF Maps 定义（兼容老内核的 struct bpf_map_def 方式）
-struct bpf_map_def SEC("maps") packet_stats = {
-    .type = BPF_MAP_TYPE_ARRAY,
-    .key_size = sizeof(__u32),
-    .value_size = sizeof(__u64),
-    .max_entries = 10,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct flow_key));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10240);
+} flow_stats SEC(".maps");
 
-struct bpf_map_def SEC("maps") flow_stats = {
-    .type = BPF_MAP_TYPE_HASH,
-    .key_size = sizeof(struct flow_key),
-    .value_size = sizeof(__u64),
-    .max_entries = 10240,
-};
-
-struct bpf_map_def SEC("maps") tc_device_stats = {
-    .type = BPF_MAP_TYPE_HASH,
-    .key_size = sizeof(struct tc_device_key),
-    .value_size = sizeof(__u64),
-    .max_entries = 1024,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct tc_device_key));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1024);
+} tc_device_stats SEC(".maps");
 
 // 统计键定义
 #define STAT_RX_PACKETS  0
@@ -204,12 +69,11 @@ struct bpf_map_def SEC("maps") tc_device_stats = {
 
 // 辅助函数：安全的统计更新
 static inline void update_stats(__u32 key, __u64 value) {
-    void *stat_ptr = bpf_map_lookup_elem(&packet_stats, &key);
+    __u64 *stat_ptr = bpf_map_lookup_elem(&packet_stats, &key);
     if (stat_ptr) {
-        __u64 *stat = (__u64 *)stat_ptr;
-        __sync_fetch_and_add(stat, value);
+        __sync_fetch_and_add(stat_ptr, value);
     } else {
-        bpf_map_update_elem(&packet_stats, &key, &value, 0);
+        bpf_map_update_elem(&packet_stats, &key, &value, BPF_ANY);
     }
 }
 
@@ -221,24 +85,22 @@ static inline void update_tc_device_stats(__u32 ifindex, __u32 direction, __u32 
         .stat_type = stat_type
     };
     
-    void *stat_ptr = bpf_map_lookup_elem(&tc_device_stats, &key);
+    __u64 *stat_ptr = bpf_map_lookup_elem(&tc_device_stats, &key);
     if (stat_ptr) {
-        __u64 *stat = (__u64 *)stat_ptr;
-        __sync_fetch_and_add(stat, value);
+        __sync_fetch_and_add(stat_ptr, value);
     } else {
-        bpf_map_update_elem(&tc_device_stats, &key, &value, 0);
+        bpf_map_update_elem(&tc_device_stats, &key, &value, BPF_ANY);
     }
 }
 
 // 辅助函数：更新流量统计
 static inline void update_flow_stats(struct flow_key *key) {
-    void *count_ptr = bpf_map_lookup_elem(&flow_stats, key);
+    __u64 *count_ptr = bpf_map_lookup_elem(&flow_stats, key);
     if (count_ptr) {
-        __u64 *count = (__u64 *)count_ptr;
-        __sync_fetch_and_add(count, 1);
+        __sync_fetch_and_add(count_ptr, 1);
     } else {
         __u64 initial_count = 1;
-        bpf_map_update_elem(&flow_stats, key, &initial_count, 0);
+        bpf_map_update_elem(&flow_stats, key, &initial_count, BPF_ANY);
     }
 }
 
@@ -256,7 +118,7 @@ int network_monitor_xdp(struct xdp_md *ctx) {
     }
     
     // 检查是否为 IP 包
-    if (eth->h_proto != ETH_P_IP_BE) {
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         return XDP_PASS;
     }
     
@@ -313,7 +175,7 @@ int network_monitor_tc_egress(struct __sk_buff *skb) {
     }
     
     // 检查是否为 IP 包
-    if (eth->h_proto != ETH_P_IP_BE) {
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         return TC_ACT_OK;
     }
     
@@ -374,7 +236,7 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
     }
     
     // 检查是否为 IP 包
-    if (eth->h_proto != ETH_P_IP_BE) {
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         return TC_ACT_OK;
     }
     
