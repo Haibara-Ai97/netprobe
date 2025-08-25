@@ -158,34 +158,33 @@ struct tc_device_key {
     __u32 stat_type;    // 统计类型 (packets/bytes)
 };
 
-// eBPF Maps 定义
-struct {
-    __u32 type;
-    __u32 max_entries;
-    __u32 *key;
-    __u64 *value;
-} packet_stats SEC(".maps") = {
+struct bpf_map_def {
+    unsigned int type;
+    unsigned int key_size;
+    unsigned int value_size;
+    unsigned int max_entries;
+    unsigned int map_flags;
+};
+
+// eBPF Maps 定义（兼容老内核的 struct bpf_map_def 方式）
+struct bpf_map_def SEC("maps") packet_stats = {
     .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u64),
     .max_entries = 10,
 };
 
-struct {
-    __u32 type;
-    __u32 max_entries;
-    struct flow_key *key;
-    __u64 *value;
-} flow_stats SEC(".maps") = {
+struct bpf_map_def SEC("maps") flow_stats = {
     .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(struct flow_key),
+    .value_size = sizeof(__u64),
     .max_entries = 10240,
 };
 
-struct {
-    __u32 type;
-    __u32 max_entries;
-    struct tc_device_key *key;
-    __u64 *value;
-} tc_device_stats SEC(".maps") = {
+struct bpf_map_def SEC("maps") tc_device_stats = {
     .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(struct tc_device_key),
+    .value_size = sizeof(__u64),
     .max_entries = 1024,
 };
 
