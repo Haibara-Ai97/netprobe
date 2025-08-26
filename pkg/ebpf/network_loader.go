@@ -2,9 +2,10 @@ package ebpf
 
 import (
 	"fmt"
-	"github.com/cilium/ebpf"
 	"net"
 	"time"
+
+	"github.com/cilium/ebpf"
 
 	"github.com/Haibara-Ai97/netprobe/ebpf/network"
 	"github.com/cilium/ebpf/link"
@@ -97,16 +98,14 @@ func (nl *NetworkLoader) AttachNetworkPrograms(interfaceName string) error {
 		fmt.Printf("✅ XDP program attached to %s\n", interfaceName)
 	}
 
-	// TC 程序需要手动附加（显示提示信息）
-	if nl.objs.NetworkMonitorTcEgress != nil {
-		fmt.Printf("💡 TC egress program available (manual setup required):\n")
-		fmt.Printf("   sudo tc qdisc add dev %s clsact\n", interfaceName)
-		fmt.Printf("   sudo tc filter add dev %s egress bpf object-file network_monitor.o section tc_egress\n", interfaceName)
-	}
-
-	if nl.objs.NetworkMonitorTcIngress != nil {
-		fmt.Printf("💡 TC ingress program available (manual setup required):\n")
-		fmt.Printf("   sudo tc filter add dev %s ingress bpf object-file network_monitor.o section tc_ingress\n", interfaceName)
+	// 检测并附加 TC 程序
+	if nl.objs.NetworkMonitorTcIngress != nil || nl.objs.NetworkMonitorTcEgress != nil {
+		err = nl.attachTCPrograms(interfaceName, iface.Index)
+		if err != nil {
+			fmt.Printf("⚠️  TC program attachment failed: %v\n", err)
+			fmt.Printf("💡 To enable TC monitoring, run:\n")
+			fmt.Printf("   sudo tc qdisc add dev %s clsact\n", interfaceName)
+		}
 	}
 
 	return nil
@@ -271,4 +270,58 @@ func formatBytes(bytes uint64) string {
 	default:
 		return fmt.Sprintf("%d B", bytes)
 	}
+}
+
+// attachTCPrograms 检测并附加 TC 程序
+func (nl *NetworkLoader) attachTCPrograms(interfaceName string, ifindex int) error {
+	// 尝试附加 TC ingress 程序
+	if nl.objs.NetworkMonitorTcIngress != nil {
+		err := nl.attachTCProgram(interfaceName, ifindex, "ingress", nl.objs.NetworkMonitorTcIngress)
+		if err != nil {
+			fmt.Printf("⚠️  TC ingress attachment failed: %v\n", err)
+		} else {
+			fmt.Printf("✅ TC ingress program attached to %s\n", interfaceName)
+		}
+	}
+
+	// 尝试附加 TC egress 程序
+	if nl.objs.NetworkMonitorTcEgress != nil {
+		err := nl.attachTCProgram(interfaceName, ifindex, "egress", nl.objs.NetworkMonitorTcEgress)
+		if err != nil {
+			fmt.Printf("⚠️  TC egress attachment failed: %v\n", err)
+		} else {
+			fmt.Printf("✅ TC egress program attached to %s\n", interfaceName)
+		}
+	}
+
+	return nil
+}
+
+// attachTCProgram 附加单个 TC 程序
+func (nl *NetworkLoader) attachTCProgram(interfaceName string, ifindex int, direction string, program *ebpf.Program) error {
+	// 确定 TC 附加点
+	var attach ebpf.AttachType
+	switch direction {
+	case "ingress":
+		attach = ebpf.AttachTCXIngress
+	case "egress":
+		attach = ebpf.AttachTCXEgress
+	default:
+		return fmt.Errorf("unsupported TC direction: %s", direction)
+	}
+
+	// 使用 TCX (tc-bpf express) 附加方式
+	tcxLink, err := link.AttachTCX(link.TCXOptions{
+		Program:   program,
+		Attach:    attach,
+		Interface: ifindex,
+	})
+	if err != nil {
+		return fmt.Errorf("TC %s attachment failed: %w", direction, err)
+	}
+
+	// 保存链接用于后续清理
+	nl.links = append(nl.links, tcxLink)
+	fmt.Printf("✅ TC %s program attached to %s using TCX\n", direction, interfaceName)
+	return nil
 }
