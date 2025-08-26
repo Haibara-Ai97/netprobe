@@ -1,70 +1,82 @@
 package ebpf
 
 import (
-"runtime"
+	"runtime"
 
-"github.com/cilium/ebpf"
-"github.com/cilium/ebpf/features"
-"github.com/cilium/ebpf/rlimit"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
+	"github.com/cilium/ebpf/rlimit"
 )
 
-// IsSupported 检查当前系统是否支持 eBPF
+// IsSupported checks if the current system supports eBPF programs
+// Verifies OS compatibility, memory limits, and required eBPF features
 func IsSupported() bool {
-if runtime.GOOS != "linux" {
-return false
+	// eBPF is only available on Linux
+	if runtime.GOOS != "linux" {
+		return false
+	}
+
+	// Remove memory limit for eBPF - required for loading programs
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return false
+	}
+
+	// Check if basic eBPF program types are supported
+	if err := features.HaveProgType(ebpf.SocketFilter); err != nil {
+		return false
+	}
+
+	// Check if basic eBPF map types are supported
+	if err := features.HaveMapType(ebpf.Array); err != nil {
+		return false
+	}
+
+	return true
 }
 
-if err := rlimit.RemoveMemlock(); err != nil {
-return false
-}
-
-if err := features.HaveProgType(ebpf.SocketFilter); err != nil {
-return false
-}
-
-if err := features.HaveMapType(ebpf.Array); err != nil {
-return false
-}
-
-return true
-}
-
-// Manager 管理 eBPF 程序的生命周期
+// Manager coordinates eBPF program lifecycle and provides high-level API
+// Manages loading, attachment, and cleanup of network monitoring programs
 type Manager struct {
-networkLoader *NetworkLoader
+	networkLoader *NetworkLoader // Handles network-specific eBPF operations
 }
 
-// NewManager 创建新的 eBPF 管理器
+// NewManager creates a new eBPF manager instance
+// Initializes all necessary components for network monitoring
 func NewManager() *Manager {
-return &Manager{
-networkLoader: NewNetworkLoader(),
-}
+	return &Manager{
+		networkLoader: NewNetworkLoader(),
+	}
 }
 
-// LoadNetworkMonitor 加载网络监控程序
+// LoadNetworkMonitor loads network monitoring eBPF programs into kernel
+// Must be called before attaching programs to interfaces
 func (m *Manager) LoadNetworkMonitor() error {
-return m.networkLoader.LoadPrograms()
+	return m.networkLoader.LoadPrograms()
 }
 
-// AttachNetworkMonitor 附加网络监控程序到指定接口
+// AttachNetworkMonitor attaches loaded programs to specified network interface
+// Interface must exist and be accessible for attachment to succeed
 func (m *Manager) AttachNetworkMonitor(interfaceName string) error {
-return m.networkLoader.AttachNetworkPrograms(interfaceName)
+	return m.networkLoader.AttachNetworkPrograms(interfaceName)
 }
 
-// GetNetworkStats 获取网络统计信息
+// GetNetworkStats retrieves current network statistics from eBPF maps
+// Returns aggregated statistics across all monitored interfaces
 func (m *Manager) GetNetworkStats() (map[string]uint64, error) {
-return m.networkLoader.GetStats()
+	return m.networkLoader.GetStats()
 }
 
-// GetNetworkLoader 获取网络加载器
+// GetNetworkLoader provides direct access to network loader for advanced operations
+// Useful for accessing eBPF maps and performing custom data collection
 func (m *Manager) GetNetworkLoader() *NetworkLoader {
-return m.networkLoader
+	return m.networkLoader
 }
 
-// Close 关闭管理器
+// Close cleans up all eBPF resources and detaches programs
+// Should be called before program termination to prevent resource leaks
 func (m *Manager) Close() error {
-if m.networkLoader != nil {
-return m.networkLoader.Close()
-}
-return nil
+	if m.networkLoader != nil {
+		return m.networkLoader.Close()
+	}
+	return nil
 }

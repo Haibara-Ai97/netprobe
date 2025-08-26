@@ -9,15 +9,15 @@ import (
 	"github.com/your-org/kube-net-probe/pkg/ebpf"
 )
 
-// TCDirection TC 流量方向
+// TCDirection represents the traffic direction in TC layer monitoring
 type TCDirection uint32
 
 const (
-	TCDirectionIngress TCDirection = 0
-	TCDirectionEgress  TCDirection = 1
+	TCDirectionIngress TCDirection = 0 // Incoming traffic
+	TCDirectionEgress  TCDirection = 1 // Outgoing traffic
 )
 
-// String 返回方向的字符串表示
+// String returns human-readable direction name
 func (d TCDirection) String() string {
 	switch d {
 	case TCDirectionIngress:
@@ -29,15 +29,15 @@ func (d TCDirection) String() string {
 	}
 }
 
-// TCStatType TC 统计类型
+// TCStatType represents the type of traffic statistics
 type TCStatType uint32
 
 const (
-	TCStatPackets TCStatType = 0
-	TCStatBytes   TCStatType = 1
+	TCStatPackets TCStatType = 0 // Packet count statistics
+	TCStatBytes   TCStatType = 1 // Byte count statistics
 )
 
-// String 返回统计类型的字符串表示
+// String returns human-readable statistics type name
 func (t TCStatType) String() string {
 	switch t {
 	case TCStatPackets:
@@ -49,55 +49,59 @@ func (t TCStatType) String() string {
 	}
 }
 
-// InterfaceStats 网络接口统计信息
+// InterfaceStats contains comprehensive network interface statistics
+// Includes both raw counters and calculated rates for monitoring
 type InterfaceStats struct {
-	InterfaceName string
-	InterfaceIndex uint32
+	InterfaceName  string    // Network interface name (e.g., eth0, wlan0)
+	InterfaceIndex uint32    // Kernel interface index
 	
-	// 入站统计
+	// Raw packet and byte counters for ingress traffic
 	IngressPackets uint64
 	IngressBytes   uint64
 	
-	// 出站统计
+	// Raw packet and byte counters for egress traffic
 	EgressPackets  uint64
 	EgressBytes    uint64
 	
-	// 速率信息 (per second)
-	IngressPacketsRate float64
-	IngressBytesRate   float64
-	EgressPacketsRate  float64
-	EgressBytesRate    float64
+	// Calculated rates per second for real-time monitoring
+	IngressPacketsRate float64 // Packets per second (ingress)
+	IngressBytesRate   float64 // Bytes per second (ingress)
+	EgressPacketsRate  float64 // Packets per second (egress)
+	EgressBytesRate    float64 // Bytes per second (egress)
 	
-	LastUpdated time.Time
+	LastUpdated time.Time // Timestamp of last statistics update
 }
 
-// previousStats 存储上一次的统计数据用于计算速率
+// previousStats stores historical data for rate calculation
 type previousStats struct {
-	packets   uint64
-	bytes     uint64
-	timestamp time.Time
+	packets   uint64    // Previous packet count
+	bytes     uint64    // Previous byte count
+	timestamp time.Time // Timestamp of previous measurement
 }
 
-// TCCollector TC 层流量数据收集器
+// TCCollector implements Traffic Control layer data collection
+// Reads statistics from eBPF maps and calculates network rates
 type TCCollector struct {
-	manager       *ebpf.Manager
-	interfaces    map[uint32]string // ifindex -> interface name
-	previousStats map[string]map[TCDirection]*previousStats // ifname -> direction -> stats
-	mutex         sync.RWMutex
-	collectInterval time.Duration
+	manager         *ebpf.Manager                                     // eBPF program manager
+	interfaces      map[uint32]string                                 // Interface index to name mapping
+	previousStats   map[string]map[TCDirection]*previousStats         // Historical data for rate calculation
+	mutex           sync.RWMutex                                      // Thread-safe access protection
+	collectInterval time.Duration                                     // Data collection frequency
 }
 
-// NewTCCollector 创建新的 TC 收集器
+// NewTCCollector creates a new Traffic Control layer collector
+// Initializes data structures for interface monitoring and rate calculation
 func NewTCCollector(manager *ebpf.Manager) *TCCollector {
 	return &TCCollector{
 		manager:         manager,
 		interfaces:      make(map[uint32]string),
 		previousStats:   make(map[string]map[TCDirection]*previousStats),
-		collectInterval: 5 * time.Second, // 默认 5 秒收集间隔
+		collectInterval: 5 * time.Second, // Default collection interval
 	}
 }
 
-// SetCollectInterval 设置收集间隔
+// SetCollectInterval configures the data collection frequency
+// Lower intervals provide more granular rate calculations but use more CPU
 func (tc *TCCollector) SetCollectInterval(interval time.Duration) {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
@@ -114,9 +118,10 @@ func (tc *TCCollector) updateInterfaceMapping() error {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
 	
-	// 清空旧的映射
+	// Clear previous interface mappings to ensure fresh state
 	tc.interfaces = make(map[uint32]string)
 	
+	// Build interface index to name mapping for efficient lookups
 	for _, iface := range interfaces {
 		tc.interfaces[uint32(iface.Index)] = iface.Name
 	}
@@ -124,7 +129,8 @@ func (tc *TCCollector) updateInterfaceMapping() error {
 	return nil
 }
 
-// getInterfaceName 根据接口索引获取接口名
+// getInterfaceName retrieves interface name by kernel index
+// Returns a fallback name if interface is not found in mapping
 func (tc *TCCollector) getInterfaceName(ifindex uint32) string {
 	tc.mutex.RLock()
 	defer tc.mutex.RUnlock()
@@ -132,15 +138,17 @@ func (tc *TCCollector) getInterfaceName(ifindex uint32) string {
 	if name, exists := tc.interfaces[ifindex]; exists {
 		return name
 	}
+	// Fallback to generic interface name if not found
 	return fmt.Sprintf("if%d", ifindex)
 }
 
-// calculateRate 计算速率
+// calculateRate computes per-second rates for packets and bytes
+// Uses previous measurements to calculate instantaneous rates
 func (tc *TCCollector) calculateRate(ifname string, direction TCDirection, currentPackets, currentBytes uint64, currentTime time.Time) (packetsRate, bytesRate float64) {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
 	
-	// 初始化接口的统计历史
+	// Initialize per-interface statistics tracking if needed
 	if tc.previousStats[ifname] == nil {
 		tc.previousStats[ifname] = make(map[TCDirection]*previousStats)
 	}

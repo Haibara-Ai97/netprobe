@@ -1,7 +1,8 @@
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I../include" --target=amd64 NetworkMonitor monitor.c
 
-// 网络监控 eBPF 程序
-// 支持 XDP 和 TC hook 点的网络流量监控
+// NetProbe eBPF Network Monitor
+// High-performance network traffic monitoring using TC (Traffic Control) hook points
+// Provides per-interface packet and byte statistics for ingress/egress traffic
 
 #include <linux/bpf.h>
 #include <linux/types.h>
@@ -14,24 +15,26 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// 自定义数据结构
+// Flow identification key for network traffic tracking
 struct flow_key {
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u8  proto;
-    __u8  pad[3];
+    __u32 src_ip;       // Source IP address
+    __u32 dst_ip;       // Destination IP address  
+    __u16 src_port;     // Source port
+    __u16 dst_port;     // Destination port
+    __u8  proto;        // Protocol (TCP/UDP/etc)
+    __u8  pad[3];       // Padding for alignment
 };
 
-// TC 设备统计键
+// TC device statistics key for per-interface monitoring
 struct tc_device_key {
-    __u32 ifindex;      // 网络设备索引
-    __u32 direction;    // 0=ingress, 1=egress
-    __u32 stat_type;    // 统计类型 (packets/bytes)
+    __u32 ifindex;      // Network interface index
+    __u32 direction;    // Traffic direction: 0=ingress, 1=egress
+    __u32 stat_type;    // Statistics type: 0=packets, 1=bytes
 };
 
-// eBPF Maps 定义
+// eBPF Maps for data collection and statistics storage
+
+// Simple packet counter array map for basic statistics
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(key_size, sizeof(__u32));
@@ -39,6 +42,7 @@ struct {
     __uint(max_entries, 10);
 } packet_stats SEC(".maps");
 
+// Hash map for per-flow statistics tracking
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(struct flow_key));
@@ -46,6 +50,8 @@ struct {
     __uint(max_entries, 10240);
 } flow_stats SEC(".maps");
 
+// Hash map for per-interface TC layer statistics
+// Key: tc_device_key, Value: counter (packets or bytes)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(struct tc_device_key));
@@ -77,7 +83,18 @@ static inline void update_stats(__u32 key, __u64 value) {
     }
 }
 
-// 辅助函数：更新 TC 设备统计
+// Helper function: Update packet statistics with atomic operations
+static inline void update_packet_stats(__u32 key, __u64 value) {
+    __u64 *stat_ptr = bpf_map_lookup_elem(&packet_stats, &key);
+    if (stat_ptr) {
+        // Use atomic add to prevent race conditions in multi-CPU environments
+        __sync_fetch_and_add(stat_ptr, value);
+    } else {
+        bpf_map_update_elem(&packet_stats, &key, &value, BPF_ANY);
+    }
+}
+
+// Helper function: Update TC device statistics for interface monitoring
 static inline void update_tc_device_stats(__u32 ifindex, __u32 direction, __u32 stat_type, __u64 value) {
     struct tc_device_key key = {
         .ifindex = ifindex,
@@ -87,9 +104,21 @@ static inline void update_tc_device_stats(__u32 ifindex, __u32 direction, __u32 
     
     __u64 *stat_ptr = bpf_map_lookup_elem(&tc_device_stats, &key);
     if (stat_ptr) {
+        // Atomic increment for thread-safe statistics update
         __sync_fetch_and_add(stat_ptr, value);
     } else {
         bpf_map_update_elem(&tc_device_stats, &key, &value, BPF_ANY);
+    }
+}
+
+// Helper function: Update flow-based statistics for network flow tracking
+static inline void update_flow_stats(struct flow_key *key) {
+    __u64 *count_ptr = bpf_map_lookup_elem(&flow_stats, key);
+    if (count_ptr) {
+        __sync_fetch_and_add(count_ptr, 1);
+    } else {
+        __u64 initial_count = 1;
+        bpf_map_update_elem(&flow_stats, key, &initial_count, BPF_ANY);
     }
 }
 
@@ -104,7 +133,9 @@ static inline void update_flow_stats(struct flow_key *key) {
     }
 }
 
-// XDP 网络监控程序
+// XDP Network Monitor Program
+// Attached to network interface for high-performance packet processing
+// Processes packets at the earliest point in the network stack
 SEC("xdp")
 int network_monitor_xdp(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -148,20 +179,22 @@ int network_monitor_xdp(struct xdp_md *ctx) {
         }
     }
     
-    // 获取包长度
+    // Extract packet length from IP header
     __u16 packet_len = bpf_ntohs(ip->tot_len);
     
-    // 更新统计信息
+    // Update packet and byte statistics
     update_stats(STAT_RX_PACKETS, 1);
     update_stats(STAT_RX_BYTES, packet_len);
     
-    // 更新流量统计
+    // Update per-flow statistics for traffic analysis
     update_flow_stats(&key);
     
     return XDP_PASS;
 }
 
-// TC 出口监控程序
+// TC Egress Monitor Program  
+// Monitors outbound traffic at the Traffic Control layer
+// Provides egress packet and byte counting per interface
 SEC("tc")
 int network_monitor_tc_egress(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
@@ -205,24 +238,26 @@ int network_monitor_tc_egress(struct __sk_buff *skb) {
         }
     }
     
-    // 获取包长度
+    // Extract packet length from IP header
     __u16 packet_len = bpf_ntohs(ip->tot_len);
     
-    // 更新全局统计
+    // Update global transmit statistics
     update_stats(STAT_TX_PACKETS, 1);
     update_stats(STAT_TX_BYTES, packet_len);
     
-    // 更新设备级 TC 统计
+    // Update per-interface TC layer statistics for egress traffic
     update_tc_device_stats(skb->ifindex, TC_DIRECTION_EGRESS, TC_STAT_PACKETS, 1);
     update_tc_device_stats(skb->ifindex, TC_DIRECTION_EGRESS, TC_STAT_BYTES, packet_len);
     
-    // 更新流量统计
+    // Update flow-level statistics for traffic analysis
     update_flow_stats(&key);
     
     return TC_ACT_OK;
 }
 
-// TC 入口监控程序
+// TC Ingress Monitor Program
+// Monitors inbound traffic at the Traffic Control layer  
+// Provides ingress packet and byte counting per interface
 SEC("tc")
 int network_monitor_tc_ingress(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
@@ -230,12 +265,12 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
     
     struct ethhdr *eth = data;
     
-    // 检查以太网头部
+    // Validate Ethernet header bounds
     if ((void *)(eth + 1) > data_end) {
         return TC_ACT_OK;
     }
     
-    // 检查是否为 IP 包
+    // Only process IPv4 packets
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         return TC_ACT_OK;
     }
@@ -266,17 +301,19 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
         }
     }
     
-    // 获取包长度
+    // Extract packet length from IP header for byte counting
     __u16 packet_len = bpf_ntohs(ip->tot_len);
     
-    // 更新设备级 TC 统计
+    // Update per-interface TC layer statistics for ingress traffic
+    // This is the primary data collection point for network monitoring
     update_tc_device_stats(skb->ifindex, TC_DIRECTION_INGRESS, TC_STAT_PACKETS, 1);
     update_tc_device_stats(skb->ifindex, TC_DIRECTION_INGRESS, TC_STAT_BYTES, packet_len);
     
-    // 更新流量统计
+    // Update flow-level statistics for detailed traffic analysis
     update_flow_stats(&key);
     
     return TC_ACT_OK;
 }
 
+// Required license declaration for eBPF programs
 char _license[] SEC("license") = "GPL";

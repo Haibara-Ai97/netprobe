@@ -17,35 +17,43 @@ import (
 )
 
 var (
-	version = "dev"
-	commit  = "unknown"
-	date    = "unknown"
+	version = "dev"     // Application version (set during build)
+	commit  = "unknown" // Git commit hash (set during build)
+	date    = "unknown" // Build date (set during build)
 )
 
 func main() {
 	var rootCmd = &cobra.Command{
 		Use:   "netprobe-agent",
-		Short: "NetProbe Agent - Network monitoring agent with eBPF",
-		Long: `NetProbe Agent runs on each node to collect network traffic data
-using eBPF TC programs. It monitors network interfaces and exposes
-metrics in Prometheus format for monitoring systems.`,
+		Short: "NetProbe Agent - High-performance network monitoring with eBPF",
+		Long: `NetProbe Agent is a network monitoring tool that uses eBPF TC programs
+to collect network traffic statistics. It monitors network interfaces at the
+Traffic Control layer and exposes metrics in Prometheus format.
+
+Features:
+- Zero-copy packet processing with eBPF
+- Per-interface traffic statistics (ingress/egress)  
+- Real-time rate calculations (packets/sec, bytes/sec)
+- Prometheus-compatible metrics export
+- Low overhead monitoring suitable for production`,
 		Version: fmt.Sprintf("%s (commit: %s, date: %s)", version, commit, date),
 		RunE:    runAgent,
 	}
 
+	// Command-line flags for agent configuration
+	// Note: We only define flags here, values are retrieved in runAgent()
 	var (
-		// 这些变量仅用于命令行参数定义，实际值在 runAgent 函数中获取
-		_ = rootCmd.Flags().String("node-name", "", "Node name (auto-detected if not specified)")
-		_ = rootCmd.Flags().Int("metrics-port", 8081, "Port for Prometheus metrics endpoint")
-		_ = rootCmd.Flags().String("metrics-path", "/metrics", "Path for metrics endpoint")
-		_ = rootCmd.Flags().Duration("collect-interval", 5*time.Second, "Data collection interval")
-		_ = rootCmd.Flags().StringSlice("interface-filter", nil, "Network interfaces to monitor (empty for all)")
-		_ = rootCmd.Flags().Bool("active-only", false, "Only export metrics for active interfaces")
-		_ = rootCmd.Flags().Bool("debug", false, "Enable debug logging")
-		_ = rootCmd.Flags().String("attach-interface", "", "Network interface to attach eBPF programs to")
+		_ = rootCmd.Flags().String("node-name", "", "Node name for identification (auto-detected if not specified)")
+		_ = rootCmd.Flags().Int("metrics-port", 8081, "HTTP port for Prometheus metrics endpoint")
+		_ = rootCmd.Flags().String("metrics-path", "/metrics", "URL path for metrics endpoint")
+		_ = rootCmd.Flags().Duration("collect-interval", 5*time.Second, "Interval between data collection cycles")
+		_ = rootCmd.Flags().StringSlice("interface-filter", nil, "Network interfaces to monitor (empty for all interfaces)")
+		_ = rootCmd.Flags().Bool("active-only", false, "Only export metrics for interfaces with active traffic")
+		_ = rootCmd.Flags().Bool("debug", false, "Enable debug logging output")
+		_ = rootCmd.Flags().String("attach-interface", "", "Specific interface to attach eBPF programs to")
 	)
 
-	// 添加 klog 标志
+	// Add klog flags for advanced logging control
 	klog.InitFlags(flag.CommandLine)
 	rootCmd.Flags().AddGoFlagSet(flag.CommandLine)
 
@@ -55,10 +63,12 @@ metrics in Prometheus format for monitoring systems.`,
 	}
 }
 
+// runAgent is the main entry point for the NetProbe agent
+// Handles initialization, eBPF program loading, and metrics collection
 func runAgent(cmd *cobra.Command, args []string) error {
 	klog.InfoS("Starting NetProbe Agent", "version", version, "commit", commit, "date", date)
 
-	// 获取命令行参数值
+	// Extract command-line flag values
 	nodeName, _ := cmd.Flags().GetString("node-name")
 	metricsPort, _ := cmd.Flags().GetInt("metrics-port")
 	metricsPath, _ := cmd.Flags().GetString("metrics-path")
@@ -68,34 +78,33 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	enableDebug, _ := cmd.Flags().GetBool("debug")
 	attachInterface, _ := cmd.Flags().GetString("attach-interface")
 
-	// 避免未使用变量警告
+	// Suppress unused variable warning for nodeName (may be used in future)
 	_ = nodeName
 
-	// 设置日志级别
+	// Configure debug logging if requested
 	if enableDebug {
-		// 设置 klog 为详细模式
-		flag.Set("v", "2")
+		flag.Set("v", "2") // Set klog to verbose level 2
 		klog.InfoS("Debug logging enabled")
 	}
 
-	// 检查 eBPF 支持
+	// Verify eBPF support on the current system
 	if !ebpf.IsSupported() {
-		return fmt.Errorf("eBPF is not supported on this system")
+		return fmt.Errorf("eBPF is not supported on this system - requires Linux kernel >= 4.15")
 	}
 	klog.InfoS("eBPF support verified")
 
-	// 创建 eBPF 管理器
+	// Initialize eBPF program manager
 	ebpfManager := ebpf.NewManager()
 	
-	// 加载网络监控程序
+	// Load network monitoring eBPF programs into kernel
 	klog.InfoS("Loading eBPF network monitor programs...")
 	if err := ebpfManager.LoadNetworkMonitor(); err != nil {
 		return fmt.Errorf("failed to load network monitor: %w", err)
 	}
-	defer ebpfManager.Close()
+	defer ebpfManager.Close() // Ensure cleanup on exit
 	klog.InfoS("eBPF programs loaded successfully")
 
-	// 如果指定了接口，尝试附加程序
+	// Attach eBPF programs to specific interface if requested
 	if attachInterface != "" {
 		klog.InfoS("Attaching eBPF programs to interface", "interface", attachInterface)
 		if err := ebpfManager.AttachNetworkMonitor(attachInterface); err != nil {

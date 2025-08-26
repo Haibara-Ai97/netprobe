@@ -10,37 +10,40 @@ import (
 	"github.com/your-org/kube-net-probe/pkg/collector"
 )
 
-// MetricType 指标类型
+// MetricType defines the type of Prometheus metric
 type MetricType string
 
 const (
-	MetricTypeCounter   MetricType = "counter"
-	MetricTypeGauge     MetricType = "gauge"
-	MetricTypeHistogram MetricType = "histogram"
-	MetricTypeSummary   MetricType = "summary"
+	MetricTypeCounter   MetricType = "counter"   // Monotonically increasing values
+	MetricTypeGauge     MetricType = "gauge"     // Values that can go up or down
+	MetricTypeHistogram MetricType = "histogram" // Distribution of observations
+	MetricTypeSummary   MetricType = "summary"   // Summary statistics
 )
 
-// Metric 表示单个 Prometheus 指标
+// Metric represents a single Prometheus-compatible metric
+// Contains all necessary information for metric export
 type Metric struct {
-	Name      string            // 指标名称
-	Type      MetricType        // 指标类型
-	Help      string            // 指标描述
-	Labels    map[string]string // 标签
-	Value     float64           // 指标值
-	Timestamp time.Time         // 时间戳
+	Name      string            // Metric name (e.g., netprobe_tc_packets_total)
+	Type      MetricType        // Prometheus metric type
+	Help      string            // Human-readable description
+	Labels    map[string]string // Key-value labels for metric dimensions
+	Value     float64           // Numeric metric value
+	Timestamp time.Time         // Collection timestamp
 }
 
-// String 返回 Prometheus 格式的指标字符串
+// String formats the metric in Prometheus exposition format
+// Returns the metric line with labels and value
 func (m *Metric) String() string {
 	var labelPairs []string
 	
-	// 按键名排序标签，确保输出一致性
+	// Sort labels by key name for consistent output
 	var keys []string
 	for k := range m.Labels {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	
+	// Build label string in key="value" format
 	for _, k := range keys {
 		labelPairs = append(labelPairs, fmt.Sprintf(`%s="%s"`, k, m.Labels[k]))
 	}
@@ -55,25 +58,29 @@ func (m *Metric) String() string {
 		return fmt.Sprintf("%s%s %.6f", m.Name, labelString, m.Value)
 	}
 	
+	// Format: metric_name{labels} value timestamp_ms
 	return fmt.Sprintf("%s%s %.6f %d", m.Name, labelString, m.Value, m.Timestamp.UnixMilli())
 }
 
-// NetworkMetrics 网络指标收集器
+// NetworkMetrics manages collection and formatting of network monitoring metrics
+// Thread-safe collector that converts interface statistics to Prometheus metrics
 type NetworkMetrics struct {
-	mutex           sync.RWMutex
-	metrics         []Metric
-	lastCollection  time.Time
-	collectionCount uint64
+	mutex           sync.RWMutex    // Protects concurrent access to metrics
+	metrics         []Metric        // Current metric collection
+	lastCollection  time.Time       // Timestamp of last metrics update
+	collectionCount uint64          // Total number of collection cycles
 }
 
-// NewNetworkMetrics 创建新的网络指标收集器
+// NewNetworkMetrics creates a new network metrics collector
+// Initializes empty metrics collection ready for use
 func NewNetworkMetrics() *NetworkMetrics {
 	return &NetworkMetrics{
 		metrics: make([]Metric, 0),
 	}
 }
 
-// Update 更新指标数据
+// Update refreshes all metrics with current interface statistics
+// Thread-safe method that replaces existing metrics with fresh data
 func (nm *NetworkMetrics) Update(stats []collector.InterfaceStats) {
 	nm.mutex.Lock()
 	defer nm.mutex.Unlock()
@@ -82,19 +89,19 @@ func (nm *NetworkMetrics) Update(stats []collector.InterfaceStats) {
 	nm.lastCollection = now
 	nm.collectionCount++
 	
-	// 清空旧的指标
+	// Clear previous metrics to avoid stale data
 	nm.metrics = nm.metrics[:0]
 	
-	// 添加元数据指标
+	// Add system-level metadata metrics
 	nm.addMetaMetrics(now)
 	
-	// 为每个接口生成指标
+	// Generate metrics for each network interface
 	for _, stat := range stats {
 		nm.addInterfaceMetrics(stat, now)
 	}
 }
 
-// addMetaMetrics 添加元数据指标
+// addMetaMetrics generates system-level monitoring metadata
 func (nm *NetworkMetrics) addMetaMetrics(now time.Time) {
 	// 收集次数
 	nm.metrics = append(nm.metrics, Metric{
