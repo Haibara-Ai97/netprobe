@@ -12,8 +12,8 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 
-	"github.com/your-org/kube-net-probe/pkg/ebpf"
-	"github.com/your-org/kube-net-probe/pkg/metrics"
+	"github.com/Haibara-Ai97/netprobe/pkg/ebpf"
+	"github.com/Haibara-Ai97/netprobe/pkg/metrics"
 )
 
 var (
@@ -95,7 +95,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	// Initialize eBPF program manager
 	ebpfManager := ebpf.NewManager()
-	
+
 	// Load network monitoring eBPF programs into kernel
 	klog.InfoS("Loading eBPF network monitor programs...")
 	if err := ebpfManager.LoadNetworkMonitor(); err != nil {
@@ -118,15 +118,15 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// 创建 metrics 导出器配置
 	exporterConfig := &metrics.ExporterConfig{
 		ServerConfig: &metrics.ServerConfig{
-			Port:         metricsPort,
-			Path:         metricsPath,
-			EnableCORS:   true,
-			EnableGzip:   true,
+			Port:       metricsPort,
+			Path:       metricsPath,
+			EnableCORS: true,
+			EnableGzip: true,
 		},
 		CollectInterval:  collectInterval,
 		InterfaceFilter:  interfaceFilter,
 		EnableActiveOnly: activeOnly,
-		LogLevel:        getLogLevel(enableDebug),
+		LogLevel:         getLogLevel(enableDebug),
 	}
 
 	// 创建 metrics 导出器
@@ -156,13 +156,13 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	klog.InfoS("NetProbe Agent started successfully")
 	klog.InfoS("Metrics endpoint", "url", exporter.GetMetricsURL())
 	klog.InfoS("Health endpoint", "url", exporter.GetHealthURL())
-	
+
 	if len(interfaceFilter) > 0 {
 		klog.InfoS("Monitoring specific interfaces", "interfaces", interfaceFilter)
 	} else {
 		klog.InfoS("Monitoring all network interfaces")
 	}
-	
+
 	if activeOnly {
 		klog.InfoS("Only active interfaces will be exported")
 	}

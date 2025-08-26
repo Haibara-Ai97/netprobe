@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your-org/kube-net-probe/pkg/collector"
+	"github.com/Haibara-Ai97/netprobe/pkg/collector"
 )
 
 // MetricType defines the type of Prometheus metric
@@ -35,29 +35,29 @@ type Metric struct {
 // Returns the metric line with labels and value
 func (m *Metric) String() string {
 	var labelPairs []string
-	
+
 	// Sort labels by key name for consistent output
 	var keys []string
 	for k := range m.Labels {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	
+
 	// Build label string in key="value" format
 	for _, k := range keys {
 		labelPairs = append(labelPairs, fmt.Sprintf(`%s="%s"`, k, m.Labels[k]))
 	}
-	
+
 	labelString := ""
 	if len(labelPairs) > 0 {
 		labelString = "{" + strings.Join(labelPairs, ",") + "}"
 	}
-	
+
 	// 根据是否有时间戳决定格式
 	if m.Timestamp.IsZero() {
 		return fmt.Sprintf("%s%s %.6f", m.Name, labelString, m.Value)
 	}
-	
+
 	// Format: metric_name{labels} value timestamp_ms
 	return fmt.Sprintf("%s%s %.6f %d", m.Name, labelString, m.Value, m.Timestamp.UnixMilli())
 }
@@ -65,10 +65,10 @@ func (m *Metric) String() string {
 // NetworkMetrics manages collection and formatting of network monitoring metrics
 // Thread-safe collector that converts interface statistics to Prometheus metrics
 type NetworkMetrics struct {
-	mutex           sync.RWMutex    // Protects concurrent access to metrics
-	metrics         []Metric        // Current metric collection
-	lastCollection  time.Time       // Timestamp of last metrics update
-	collectionCount uint64          // Total number of collection cycles
+	mutex           sync.RWMutex // Protects concurrent access to metrics
+	metrics         []Metric     // Current metric collection
+	lastCollection  time.Time    // Timestamp of last metrics update
+	collectionCount uint64       // Total number of collection cycles
 }
 
 // NewNetworkMetrics creates a new network metrics collector
@@ -84,17 +84,17 @@ func NewNetworkMetrics() *NetworkMetrics {
 func (nm *NetworkMetrics) Update(stats []collector.InterfaceStats) {
 	nm.mutex.Lock()
 	defer nm.mutex.Unlock()
-	
+
 	now := time.Now()
 	nm.lastCollection = now
 	nm.collectionCount++
-	
+
 	// Clear previous metrics to avoid stale data
 	nm.metrics = nm.metrics[:0]
-	
+
 	// Add system-level metadata metrics
 	nm.addMetaMetrics(now)
-	
+
 	// Generate metrics for each network interface
 	for _, stat := range stats {
 		nm.addInterfaceMetrics(stat, now)
@@ -111,7 +111,7 @@ func (nm *NetworkMetrics) addMetaMetrics(now time.Time) {
 		Value:     float64(nm.collectionCount),
 		Timestamp: now,
 	})
-	
+
 	// 最后收集时间
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_last_collection_timestamp_seconds",
@@ -120,7 +120,7 @@ func (nm *NetworkMetrics) addMetaMetrics(now time.Time) {
 		Value:     float64(now.Unix()),
 		Timestamp: now,
 	})
-	
+
 	// 当前时间（用于健康检查）
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_up",
@@ -137,7 +137,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		"interface": stat.InterfaceName,
 		"ifindex":   fmt.Sprintf("%d", stat.InterfaceIndex),
 	}
-	
+
 	// 入站包数指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_packets_total",
@@ -147,7 +147,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     float64(stat.IngressPackets),
 		Timestamp: now,
 	})
-	
+
 	// 出站包数指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_packets_total",
@@ -157,7 +157,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     float64(stat.EgressPackets),
 		Timestamp: now,
 	})
-	
+
 	// 入站字节数指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_bytes_total",
@@ -167,7 +167,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     float64(stat.IngressBytes),
 		Timestamp: now,
 	})
-	
+
 	// 出站字节数指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_bytes_total",
@@ -177,7 +177,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     float64(stat.EgressBytes),
 		Timestamp: now,
 	})
-	
+
 	// 入站包速率指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_packets_per_second",
@@ -187,7 +187,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     stat.IngressPacketsRate,
 		Timestamp: now,
 	})
-	
+
 	// 出站包速率指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_packets_per_second",
@@ -197,7 +197,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     stat.EgressPacketsRate,
 		Timestamp: now,
 	})
-	
+
 	// 入站字节速率指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_bytes_per_second",
@@ -207,7 +207,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     stat.IngressBytesRate,
 		Timestamp: now,
 	})
-	
+
 	// 出站字节速率指标
 	nm.metrics = append(nm.metrics, Metric{
 		Name:      "netprobe_tc_bytes_per_second",
@@ -217,7 +217,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 		Value:     stat.EgressBytesRate,
 		Timestamp: now,
 	})
-	
+
 	// 接口活跃状态指标
 	activeValue := 0.0
 	if stat.HasActivity() {
@@ -237,7 +237,7 @@ func (nm *NetworkMetrics) addInterfaceMetrics(stat collector.InterfaceStats, now
 func (nm *NetworkMetrics) GetMetrics() []Metric {
 	nm.mutex.RLock()
 	defer nm.mutex.RUnlock()
-	
+
 	// 返回指标的副本
 	result := make([]Metric, len(nm.metrics))
 	copy(result, nm.metrics)
@@ -248,50 +248,50 @@ func (nm *NetworkMetrics) GetMetrics() []Metric {
 func (nm *NetworkMetrics) GetPrometheusFormat() string {
 	nm.mutex.RLock()
 	defer nm.mutex.RUnlock()
-	
+
 	var output strings.Builder
-	
+
 	// 按指标名称分组
 	metricGroups := make(map[string][]Metric)
 	helpTexts := make(map[string]string)
 	typeTexts := make(map[string]MetricType)
-	
+
 	for _, metric := range nm.metrics {
 		metricGroups[metric.Name] = append(metricGroups[metric.Name], metric)
 		helpTexts[metric.Name] = metric.Help
 		typeTexts[metric.Name] = metric.Type
 	}
-	
+
 	// 按指标名称排序
 	var metricNames []string
 	for name := range metricGroups {
 		metricNames = append(metricNames, name)
 	}
 	sort.Strings(metricNames)
-	
+
 	// 输出每个指标组
 	for _, name := range metricNames {
 		metrics := metricGroups[name]
-		
+
 		// 输出 HELP 注释
 		if help := helpTexts[name]; help != "" {
 			output.WriteString(fmt.Sprintf("# HELP %s %s\n", name, help))
 		}
-		
+
 		// 输出 TYPE 注释
 		if metricType := typeTexts[name]; metricType != "" {
 			output.WriteString(fmt.Sprintf("# TYPE %s %s\n", name, metricType))
 		}
-		
+
 		// 输出指标值
 		for _, metric := range metrics {
 			output.WriteString(metric.String())
 			output.WriteString("\n")
 		}
-		
+
 		output.WriteString("\n")
 	}
-	
+
 	return output.String()
 }
 
@@ -319,16 +319,16 @@ func (nm *NetworkMetrics) GetCollectionCount() uint64 {
 // mergeLabels 合并标签映射
 func mergeLabels(base, additional map[string]string) map[string]string {
 	result := make(map[string]string)
-	
+
 	// 复制基础标签
 	for k, v := range base {
 		result[k] = v
 	}
-	
+
 	// 添加额外标签
 	for k, v := range additional {
 		result[k] = v
 	}
-	
+
 	return result
 }

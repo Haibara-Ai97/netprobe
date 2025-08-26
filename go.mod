@@ -1,4 +1,4 @@
-module github.com/your-org/kube-net-probe
+module github.com/Haibara-Ai97/netprobe
 
 go 1.21
 

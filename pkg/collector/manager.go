@@ -7,28 +7,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your-org/kube-net-probe/pkg/ebpf"
+	"github.com/Haibara-Ai97/netprobe/pkg/ebpf"
 )
 
 // Collector 定义收集器接口
 type Collector interface {
 	// CollectOnce 执行一次数据收集
 	CollectOnce() ([]InterfaceStats, error)
-	
+
 	// StartPeriodicCollection 启动周期性收集
 	StartPeriodicCollection(ctx context.Context) <-chan CollectionResult
-	
+
 	// GetInterfaceCount 获取监控的接口数量
 	GetInterfaceCount() int
-	
+
 	// SetCollectInterval 设置收集间隔
 	SetCollectInterval(interval time.Duration)
 }
 
 // CollectionResult 收集结果
 type CollectionResult struct {
-	Stats []InterfaceStats
-	Error error
+	Stats     []InterfaceStats
+	Error     error
 	Timestamp time.Time
 }
 
@@ -56,7 +56,7 @@ func (m *Manager) GetTCCollector() *TCCollector {
 func (m *Manager) SetCollectInterval(interval time.Duration) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	
+
 	if m.tcCollector != nil {
 		m.tcCollector.SetCollectInterval(interval)
 	}
@@ -66,19 +66,19 @@ func (m *Manager) SetCollectInterval(interval time.Duration) {
 func (m *Manager) Start(ctx context.Context) <-chan CollectionResult {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	
+
 	if m.isRunning {
 		log.Println("Collection manager is already running")
 		return nil
 	}
-	
+
 	// 创建可取消的上下文
 	childCtx, cancel := context.WithCancel(ctx)
 	m.cancelFunc = cancel
 	m.isRunning = true
-	
+
 	resultChan := make(chan CollectionResult, 10)
-	
+
 	go func() {
 		defer close(resultChan)
 		defer func() {
@@ -86,22 +86,22 @@ func (m *Manager) Start(ctx context.Context) <-chan CollectionResult {
 			m.isRunning = false
 			m.mutex.Unlock()
 		}()
-		
+
 		// 启动 TC 收集器
 		tcResultChan := m.startTCCollection(childCtx)
-		
+
 		for {
 			select {
 			case <-childCtx.Done():
 				log.Println("Collection manager stopped")
 				return
-				
+
 			case tcResult, ok := <-tcResultChan:
 				if !ok {
 					log.Println("TC collection channel closed")
 					return
 				}
-				
+
 				// 转发结果
 				select {
 				case resultChan <- tcResult:
@@ -114,23 +114,23 @@ func (m *Manager) Start(ctx context.Context) <-chan CollectionResult {
 			}
 		}
 	}()
-	
+
 	return resultChan
 }
 
 // startTCCollection 启动 TC 收集
 func (m *Manager) startTCCollection(ctx context.Context) <-chan CollectionResult {
 	resultChan := make(chan CollectionResult, 5)
-	
+
 	go func() {
 		defer close(resultChan)
-		
+
 		ticker := time.NewTicker(m.tcCollector.collectInterval)
 		defer ticker.Stop()
-		
+
 		// 立即执行一次收集
 		m.performTCCollection(resultChan)
-		
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -140,7 +140,7 @@ func (m *Manager) startTCCollection(ctx context.Context) <-chan CollectionResult
 			}
 		}
 	}()
-	
+
 	return resultChan
 }
 
@@ -152,7 +152,7 @@ func (m *Manager) performTCCollection(resultChan chan<- CollectionResult) {
 		Error:     err,
 		Timestamp: time.Now(),
 	}
-	
+
 	select {
 	case resultChan <- result:
 	default:
@@ -165,16 +165,16 @@ func (m *Manager) performTCCollection(resultChan chan<- CollectionResult) {
 func (m *Manager) Stop() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	
+
 	if !m.isRunning {
 		return
 	}
-	
+
 	if m.cancelFunc != nil {
 		m.cancelFunc()
 		m.cancelFunc = nil
 	}
-	
+
 	log.Println("Collection manager stopped")
 }
 
@@ -189,11 +189,11 @@ func (m *Manager) IsRunning() bool {
 func (m *Manager) GetCollectionStatus() CollectionStatus {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	
+
 	return CollectionStatus{
-		IsRunning:        m.isRunning,
-		InterfaceCount:   m.tcCollector.GetInterfaceCount(),
-		CollectInterval:  m.tcCollector.collectInterval,
+		IsRunning:           m.isRunning,
+		InterfaceCount:      m.tcCollector.GetInterfaceCount(),
+		CollectInterval:     m.tcCollector.collectInterval,
 		SupportedInterfaces: m.tcCollector.GetSupportedInterfaces(),
 	}
 }
@@ -212,7 +212,7 @@ func (cs *CollectionStatus) String() string {
 	if cs.IsRunning {
 		status = "running"
 	}
-	
+
 	return fmt.Sprintf("Collection Status: %s, Interfaces: %d, Interval: %v",
 		status, cs.InterfaceCount, cs.CollectInterval)
 }

@@ -2,12 +2,13 @@ package ebpf
 
 import (
 	"fmt"
+	"github.com/cilium/ebpf"
 	"net"
 	"time"
 
+	"github.com/Haibara-Ai97/netprobe/ebpf/network"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
-	"github.com/your-org/kube-net-probe/ebpf/network"
 )
 
 // TCDeviceKey TC 设备统计键
@@ -200,18 +201,18 @@ func (nl *NetworkLoader) ReadFlowStats() (map[FlowKey]uint64, error) {
 }
 
 // GetPacketStatsMap 获取包统计 Map
-func (nl *NetworkLoader) GetPacketStatsMap() *network.NetworkMonitorMaps {
-	return &nl.objs.NetworkMonitorMaps
+func (nl *NetworkLoader) GetPacketStatsMap() *ebpf.Map {
+	return nl.objs.PacketStats
 }
 
 // GetFlowStatsMap 获取流统计 Map
-func (nl *NetworkLoader) GetFlowStatsMap() *network.NetworkMonitorMaps {
-	return &nl.objs.NetworkMonitorMaps
+func (nl *NetworkLoader) GetFlowStatsMap() *ebpf.Map {
+	return nl.objs.FlowStats
 }
 
 // GetTcDeviceStatsMap 获取 TC 设备统计 Map
-func (nl *NetworkLoader) GetTcDeviceStatsMap() *network.NetworkMonitorMaps {
-	return &nl.objs.NetworkMonitorMaps
+func (nl *NetworkLoader) GetTcDeviceStatsMap() *ebpf.Map {
+	return nl.objs.TcDeviceStats
 }
 
 // Close 关闭加载器和所有资源

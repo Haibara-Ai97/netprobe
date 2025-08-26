@@ -8,18 +8,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your-org/kube-net-probe/pkg/collector"
+	"github.com/Haibara-Ai97/netprobe/pkg/collector"
 )
 
 // ServerConfig HTTP 服务器配置
 type ServerConfig struct {
-	Port            int           // 监听端口，默认 8081
-	Path            string        // metrics 路径，默认 "/metrics"
-	ReadTimeout     time.Duration // 读取超时，默认 10 秒
-	WriteTimeout    time.Duration // 写入超时，默认 10 秒
-	MaxHeaderBytes  int           // 最大头部字节数，默认 1MB
-	EnableCORS      bool          // 是否启用 CORS
-	EnableGzip      bool          // 是否启用 Gzip 压缩
+	Port           int           // 监听端口，默认 8081
+	Path           string        // metrics 路径，默认 "/metrics"
+	ReadTimeout    time.Duration // 读取超时，默认 10 秒
+	WriteTimeout   time.Duration // 写入超时，默认 10 秒
+	MaxHeaderBytes int           // 最大头部字节数，默认 1MB
+	EnableCORS     bool          // 是否启用 CORS
+	EnableGzip     bool          // 是否启用 Gzip 压缩
 }
 
 // DefaultServerConfig 返回默认服务器配置
@@ -51,7 +51,7 @@ func NewServer(config *ServerConfig) *Server {
 	if config == nil {
 		config = DefaultServerConfig()
 	}
-	
+
 	return &Server{
 		config:         config,
 		networkMetrics: NewNetworkMetrics(),
@@ -67,24 +67,24 @@ func (s *Server) UpdateMetrics(stats []collector.InterfaceStats) {
 func (s *Server) Start(ctx context.Context) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	
+
 	if s.isRunning {
 		return fmt.Errorf("server is already running")
 	}
-	
+
 	// 创建 HTTP 路由
 	mux := http.NewServeMux()
-	
+
 	// 注册 metrics 端点
 	mux.HandleFunc(s.config.Path, s.handleMetrics)
-	
+
 	// 注册健康检查端点
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/healthz", s.handleHealth)
-	
+
 	// 注册根路径，提供指引信息
 	mux.HandleFunc("/", s.handleRoot)
-	
+
 	// 创建 HTTP 服务器
 	s.httpServer = &http.Server{
 		Addr:           fmt.Sprintf(":%d", s.config.Port),
@@ -93,25 +93,25 @@ func (s *Server) Start(ctx context.Context) error {
 		WriteTimeout:   s.config.WriteTimeout,
 		MaxHeaderBytes: s.config.MaxHeaderBytes,
 	}
-	
+
 	// 启动服务器
 	s.isRunning = true
-	
+
 	go func() {
 		log.Printf("🚀 Metrics server starting on port %d", s.config.Port)
 		log.Printf("📊 Metrics endpoint: http://localhost:%d%s", s.config.Port, s.config.Path)
-		
+
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("❌ Metrics server error: %v", err)
 		}
 	}()
-	
+
 	// 等待上下文取消
 	go func() {
 		<-ctx.Done()
 		s.Stop()
 	}()
-	
+
 	return nil
 }
 
@@ -119,23 +119,23 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Stop() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	
+
 	if !s.isRunning {
 		return nil
 	}
-	
+
 	s.isRunning = false
-	
+
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		
+
 		if err := s.httpServer.Shutdown(ctx); err != nil {
 			log.Printf("⚠️  Error shutting down metrics server: %v", err)
 			return err
 		}
 	}
-	
+
 	log.Println("🛑 Metrics server stopped")
 	return nil
 }
@@ -151,16 +151,16 @@ func (s *Server) IsRunning() bool {
 func (s *Server) GetStats() ServerStats {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	
+
 	return ServerStats{
-		IsRunning:        s.isRunning,
-		Port:             s.config.Port,
-		MetricsPath:      s.config.Path,
-		RequestCount:     s.requestCount,
-		LastRequestTime:  s.lastRequestTime,
-		MetricCount:      s.networkMetrics.GetMetricCount(),
+		IsRunning:          s.isRunning,
+		Port:               s.config.Port,
+		MetricsPath:        s.config.Path,
+		RequestCount:       s.requestCount,
+		LastRequestTime:    s.lastRequestTime,
+		MetricCount:        s.networkMetrics.GetMetricCount(),
 		LastCollectionTime: s.networkMetrics.GetLastCollectionTime(),
-		CollectionCount:  s.networkMetrics.GetCollectionCount(),
+		CollectionCount:    s.networkMetrics.GetCollectionCount(),
 	}
 }
 
@@ -182,7 +182,7 @@ func (ss *ServerStats) String() string {
 	if ss.IsRunning {
 		status = "running"
 	}
-	
+
 	return fmt.Sprintf(
 		"Metrics Server: %s on port %d\n"+
 			"  Endpoint: %s\n"+
@@ -201,20 +201,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.requestCount++
 	s.lastRequestTime = time.Now()
 	s.mutex.Unlock()
-	
+
 	// 设置响应头
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	
+
 	// 获取 Prometheus 格式的指标
 	metricsOutput := s.networkMetrics.GetPrometheusFormat()
-	
+
 	// 如果没有数据，返回基本的健康状态
 	if metricsOutput == "" {
 		metricsOutput = "# HELP netprobe_up Whether the netprobe exporter is up\n" +
 			"# TYPE netprobe_up gauge\n" +
 			"netprobe_up 1\n"
 	}
-	
+
 	// 写入响应
 	if _, err := w.Write([]byte(metricsOutput)); err != nil {
 		log.Printf("⚠️  Error writing metrics response: %v", err)
@@ -226,20 +226,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // handleHealth 处理健康检查请求
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	stats := s.GetStats()
-	
+
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	healthStatus := "ok"
 	statusCode := http.StatusOK
-	
+
 	// 检查最后收集时间，如果超过 30 秒没有收集数据，认为不健康
 	if !stats.LastCollectionTime.IsZero() && time.Since(stats.LastCollectionTime) > 30*time.Second {
 		healthStatus = "stale"
 		statusCode = http.StatusServiceUnavailable
 	}
-	
+
 	w.WriteHeader(statusCode)
-	
+
 	response := fmt.Sprintf(`{
   "status": "%s",
   "timestamp": "%s",
@@ -260,7 +260,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		stats.MetricCount,
 		stats.CollectionCount,
 		stats.LastCollectionTime.UTC().Format(time.RFC3339))
-	
+
 	w.Write([]byte(response))
 }
 
@@ -270,9 +270,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
@@ -326,7 +326,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 </body>
 </html>`,
 		s.config.Path, s.config.Path, s.config.Port)
-	
+
 	w.Write([]byte(html))
 }
 
@@ -334,12 +334,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 func (s *Server) wrapMiddleware(handler http.Handler) http.Handler {
 	// 日志中间件
 	handler = s.loggingMiddleware(handler)
-	
+
 	// CORS 中间件
 	if s.config.EnableCORS {
 		handler = s.corsMiddleware(handler)
 	}
-	
+
 	return handler
 }
 
@@ -347,13 +347,13 @@ func (s *Server) wrapMiddleware(handler http.Handler) http.Handler {
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		
+
 		// 创建响应写入器来捕获状态码
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		
+
 		// 处理请求
 		next.ServeHTTP(rw, r)
-		
+
 		// 记录日志
 		duration := time.Since(start)
 		log.Printf("📊 %s %s %d %v %s",
@@ -367,12 +367,12 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		
+
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		
+
 		next.ServeHTTP(w, r)
 	})
 }
