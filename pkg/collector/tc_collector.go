@@ -144,7 +144,8 @@ func (tc *TCCollector) getInterfaceName(ifindex uint32) string {
 
 // calculateRate computes per-second rates for packets and bytes
 // Uses previous measurements to calculate instantaneous rates
-func (tc *TCCollector) calculateRate(ifname string, direction TCDirection, currentPackets, currentBytes uint64, currentTime time.Time) (packetsRate, bytesRate float64) {
+func (tc *TCCollector) calculateRate(ifname string, direction TCDirection, currentPackets,
+	currentBytes uint64, currentTime time.Time) (packetsRate, bytesRate float64) {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
 
@@ -211,7 +212,6 @@ func (tc *TCCollector) CollectOnce() ([]InterfaceStats, error) {
 
 	// 读取 TC 设备统计
 	tcStats, err := networkLoader.ReadTCDeviceStats()
-	fmt.Printf("tcStats: %+v\n", len(tcStats))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read TC device stats: %w", err)
 	}
