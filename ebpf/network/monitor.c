@@ -104,10 +104,47 @@ struct {
 #define EVENT_TYPE_ANOMALY   1
 #define EVENT_TYPE_SECURITY  2
 
+// Hook 位置定义
+#define HOOK_XDP        1
+#define HOOK_TC_INGRESS 2  
+#define HOOK_TC_EGRESS  3
+
 // 前向声明
 static inline void update_stats(__u32 key, __u64 value);
 static inline void update_flow_stats(struct flow_key *key);
 static inline void update_tc_device_stats(__u32 ifindex, __u32 direction, __u32 stat_type, __u64 value);
+
+// Ring Buffer 配置映射
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+} ringbuf_config SEC(".maps");
+
+#define CONFIG_ENABLE_XDP_EVENTS     (1 << 0)
+#define CONFIG_ENABLE_TC_EVENTS      (1 << 1)
+#define CONFIG_ENABLE_DETAILED_EVENTS (1 << 2)
+
+// Helper function: Check if should send ring buffer event
+static inline int should_send_event(__u8 hook_type) {
+    __u32 key = 0;
+    __u32 *config = bpf_map_lookup_elem(&ringbuf_config, &key);
+    if (!config) {
+        // Default: only TC ingress sends events to avoid duplicates
+        return (hook_type == HOOK_TC_INGRESS);
+    }
+    
+    switch (hook_type) {
+        case HOOK_XDP:
+            return (*config & CONFIG_ENABLE_XDP_EVENTS) != 0;
+        case HOOK_TC_INGRESS:
+        case HOOK_TC_EGRESS:
+            return (*config & CONFIG_ENABLE_TC_EVENTS) != 0;
+        default:
+            return 0;
+    }
+}
 
 // Helper function: Send network event via Ring Buffer (zero-copy)
 static inline int send_network_event(struct network_event *event) {
@@ -237,8 +274,10 @@ int network_monitor_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
     
-    // Send event via ring buffer
-    send_network_event(&event);
+    // Only send event if configured (避免重复)
+    if (should_send_event(HOOK_XDP)) {
+        send_network_event(&event);
+    }
     
     // Prepare flow key for legacy statistics
     struct flow_key flow_key = {
@@ -272,8 +311,10 @@ int network_monitor_tc_egress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     
-    // Send event via ring buffer
-    send_network_event(&event);
+    // Only send event if configured (避免重复)
+    if (should_send_event(HOOK_TC_EGRESS)) {
+        send_network_event(&event);
+    }
     
     // Prepare flow key for legacy statistics
     struct flow_key flow_key = {
@@ -313,8 +354,9 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     
-    // Send event via ring buffer
-    send_network_event(&event);
+    if (should_send_event(HOOK_TC_INGRESS)) {
+        send_network_event(&event);
+    }
     
     // Prepare flow key for legacy statistics
     struct flow_key flow_key = {

@@ -1,16 +1,86 @@
 package ebpf
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/Haibara-Ai97/netprobe/ebpf/network"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
+
+// NetworkEvent Ring Buffer 事件结构体（与 eBPF 程序中的结构体对应）
+type NetworkEvent struct {
+	Timestamp uint64  // 8 bytes - 事件时间戳（纳秒）
+	SrcIP     uint32  // 4 bytes - 源IP地址
+	DstIP     uint32  // 4 bytes - 目标IP地址
+	SrcPort   uint16  // 2 bytes - 源端口
+	DstPort   uint16  // 2 bytes - 目标端口
+	PacketLen uint16  // 2 bytes - 包长度
+	Protocol  uint8   // 1 byte  - 协议类型
+	Direction uint8   // 1 byte  - 流量方向 (0=ingress, 1=egress)
+	TCPFlags  uint8   // 1 byte  - TCP标志位
+	EventType uint8   // 1 byte  - 事件类型
+	Ifindex   uint32  // 4 bytes - 网络接口索引
+	// 总计: 32 bytes (已对齐)
+}
+
+// String 格式化显示网络事件
+func (ne *NetworkEvent) String() string {
+	srcIP := intToIP(ne.SrcIP)
+	dstIP := intToIP(ne.DstIP)
+	direction := "INGRESS"
+	if ne.Direction == 1 {
+		direction = "EGRESS"
+	}
+	protocol := getProtocolName(ne.Protocol)
+	timestamp := time.Unix(0, int64(ne.Timestamp))
+	
+	return fmt.Sprintf("[%s] %s %s:%d -> %s:%d (%s, %d bytes) at %s",
+		direction, protocol, srcIP, ne.SrcPort, dstIP, ne.DstPort,
+		protocol, ne.PacketLen, timestamp.Format("15:04:05.000"))
+}
+
+// RingBufferConfig Ring Buffer 配置
+type RingBufferConfig struct {
+	EnableXDPEvents     bool // 启用 XDP 事件
+	EnableTCEvents      bool // 启用 TC 事件  
+	EnableDetailedEvents bool // 启用详细事件
+}
+
+// EventHandler 事件处理器接口
+type EventHandler interface {
+	HandleEvent(event *NetworkEvent) error
+	HandleBatch(events []*NetworkEvent) error
+}
+
+// RingBufferReader Ring Buffer 读取器
+type RingBufferReader struct {
+	reader      *ringbuf.Reader
+	eventChan   chan *NetworkEvent
+	batchChan   chan []*NetworkEvent
+	handlers    []EventHandler
+	
+	// 配置
+	batchSize    int
+	batchTimeout time.Duration
+	bufferSize   int
+	
+	// 统计
+	eventsRead   uint64
+	eventsDropped uint64
+	batchesProcessed uint64
+	
+	// 控制
+	ctx    context.Context
+	cancel context.CancelFunc
+}
 
 // TCDeviceKey TC 设备统计键
 type TCDeviceKey struct {
@@ -42,38 +112,235 @@ type PacketInfo struct {
 
 // NetworkLoader 网络监控程序加载器，使用 bpf2go 生成的代码
 type NetworkLoader struct {
-	objs  network.NetworkMonitorObjects
-	links []link.Link
+	objs          network.NetworkMonitorObjects
+	links         []link.Link
+	
+	// Ring Buffer 支持
+	ringbufReader *RingBufferReader
+	config        *RingBufferConfig
 }
 
 // NewNetworkLoader 创建网络加载器
 func NewNetworkLoader() *NetworkLoader {
-	return &NetworkLoader{}
+	return &NetworkLoader{
+		config: &RingBufferConfig{
+			EnableTCEvents: true, // 默认启用 TC 事件，避免重复
+		},
+	}
 }
 
 // LoadPrograms 加载 bpf2go 生成的程序
 func (nl *NetworkLoader) LoadPrograms() error {
-	// 移除内存锁限制
+	// 移除内存限制
 	if err := rlimit.RemoveMemlock(); err != nil {
-		return fmt.Errorf("removing memlock: %w", err)
+		return fmt.Errorf("removing memlock limit: %w", err)
 	}
 
-	// 使用 bpf2go 生成的函数加载程序和 Maps
+	// 加载 eBPF 程序和映射
 	if err := network.LoadNetworkMonitorObjects(&nl.objs, nil); err != nil {
 		return fmt.Errorf("loading network monitor objects: %w", err)
 	}
 
-	fmt.Println("✅ NetworkMonitor objects loaded successfully")
-	fmt.Printf("📋 Loaded programs: XDP=%v, TC_Egress=%v, TC_Ingress=%v\n",
-		nl.objs.NetworkMonitorXdp != nil,
-		nl.objs.NetworkMonitorTcEgress != nil,
-		nl.objs.NetworkMonitorTcIngress != nil)
-	fmt.Printf("📋 Loaded maps: FlowStats=%v, PacketStats=%v, TcDeviceStats=%v\n",
-		nl.objs.FlowStats != nil,
-		nl.objs.PacketStats != nil,
-		nl.objs.TcDeviceStats != nil)
-
+	fmt.Println("✅ Successfully loaded eBPF programs")
+	
+	// 配置 Ring Buffer
+	if err := nl.configureRingBuffer(); err != nil {
+		return fmt.Errorf("configuring ring buffer: %w", err)
+	}
+	
 	return nil
+}
+
+// configureRingBuffer 配置 Ring Buffer 设置
+func (nl *NetworkLoader) configureRingBuffer() error {
+	// 设置配置值
+	var configValue uint32 = 0
+	if nl.config.EnableXDPEvents {
+		configValue |= 1 << 0 // CONFIG_ENABLE_XDP_EVENTS
+	}
+	if nl.config.EnableTCEvents {
+		configValue |= 1 << 1 // CONFIG_ENABLE_TC_EVENTS
+	}
+	if nl.config.EnableDetailedEvents {
+		configValue |= 1 << 2 // CONFIG_ENABLE_DETAILED_EVENTS
+	}
+	
+	// 更新配置映射
+	key := uint32(0)
+	if err := nl.objs.RingbufConfig.Update(key, configValue, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("updating ringbuf config: %w", err)
+	}
+	
+	fmt.Printf("✅ Ring Buffer configured: XDP=%t, TC=%t, Detailed=%t\n",
+		nl.config.EnableXDPEvents, nl.config.EnableTCEvents, nl.config.EnableDetailedEvents)
+	
+	return nil
+}
+
+// InitializeRingBufferReader 初始化 Ring Buffer 读取器
+func (nl *NetworkLoader) InitializeRingBufferReader(ctx context.Context) error {
+	if nl.objs.Events == nil {
+		return fmt.Errorf("events map not available")
+	}
+	
+	reader, err := ringbuf.NewReader(nl.objs.Events)
+	if err != nil {
+		return fmt.Errorf("creating ring buffer reader: %w", err)
+	}
+	
+	childCtx, cancel := context.WithCancel(ctx)
+	
+	nl.ringbufReader = &RingBufferReader{
+		reader:       reader,
+		eventChan:    make(chan *NetworkEvent, 1000),
+		batchChan:    make(chan []*NetworkEvent, 100),
+		handlers:     []EventHandler{},
+		batchSize:    100,
+		batchTimeout: 100 * time.Millisecond,
+		bufferSize:   1000,
+		ctx:          childCtx,
+		cancel:       cancel,
+	}
+	
+	return nil
+}
+
+// StartRingBufferProcessing 启动 Ring Buffer 事件处理
+func (nl *NetworkLoader) StartRingBufferProcessing() error {
+	if nl.ringbufReader == nil {
+		return fmt.Errorf("ring buffer reader not initialized")
+	}
+	
+	// 启动事件读取协程
+	go nl.ringbufReader.readEvents()
+	
+	// 启动批处理协程
+	go nl.ringbufReader.batchProcessor()
+	
+	fmt.Println("✅ Ring Buffer processing started")
+	return nil
+}
+
+// AddEventHandler 添加事件处理器
+func (nl *NetworkLoader) AddEventHandler(handler EventHandler) {
+	if nl.ringbufReader != nil {
+		nl.ringbufReader.handlers = append(nl.ringbufReader.handlers, handler)
+	}
+}
+
+// GetEventChannel 获取事件通道（用于自定义处理）
+func (nl *NetworkLoader) GetEventChannel() <-chan *NetworkEvent {
+	if nl.ringbufReader != nil {
+		return nl.ringbufReader.eventChan
+	}
+	return nil
+}
+
+// GetBatchChannel 获取批量事件通道
+func (nl *NetworkLoader) GetBatchChannel() <-chan []*NetworkEvent {
+	if nl.ringbufReader != nil {
+		return nl.ringbufReader.batchChan
+	}
+	return nil
+}
+
+// SetRingBufferConfig 设置 Ring Buffer 配置
+func (nl *NetworkLoader) SetRingBufferConfig(config *RingBufferConfig) {
+	nl.config = config
+}
+
+// readEvents Ring Buffer 事件读取循环
+func (rbr *RingBufferReader) readEvents() {
+	defer close(rbr.eventChan)
+	
+	for {
+		select {
+		case <-rbr.ctx.Done():
+			return
+		default:
+			// 从 Ring Buffer 读取事件
+			record, err := rbr.reader.Read()
+			if err != nil {
+				if err == ringbuf.ErrClosed {
+					return
+				}
+				continue
+			}
+			
+			// 解析事件（零拷贝）
+			if len(record.RawSample) >= int(unsafe.Sizeof(NetworkEvent{})) {
+				event := (*NetworkEvent)(unsafe.Pointer(&record.RawSample[0]))
+				rbr.eventsRead++
+				
+				select {
+				case rbr.eventChan <- event:
+				case <-rbr.ctx.Done():
+					return
+				default:
+					// 缓冲区满，丢弃事件
+					rbr.eventsDropped++
+				}
+			}
+		}
+	}
+}
+
+// batchProcessor 批量事件处理器
+func (rbr *RingBufferReader) batchProcessor() {
+	defer close(rbr.batchChan)
+	
+	ticker := time.NewTicker(rbr.batchTimeout)
+	defer ticker.Stop()
+	
+	batch := make([]*NetworkEvent, 0, rbr.batchSize)
+	
+	for {
+		select {
+		case <-rbr.ctx.Done():
+			if len(batch) > 0 {
+				rbr.processBatch(batch)
+			}
+			return
+			
+		case event := <-rbr.eventChan:
+			batch = append(batch, event)
+			
+			// 批次满了
+			if len(batch) >= rbr.batchSize {
+				rbr.processBatch(batch)
+				batch = batch[:0] // 重置切片
+			}
+			
+		case <-ticker.C:
+			// 超时，处理当前批次
+			if len(batch) > 0 {
+				rbr.processBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+// processBatch 处理事件批次
+func (rbr *RingBufferReader) processBatch(batch []*NetworkEvent) {
+	rbr.batchesProcessed++
+	
+	// 发送到批量通道
+	select {
+	case rbr.batchChan <- batch:
+	case <-rbr.ctx.Done():
+		return
+	default:
+		// 非阻塞
+	}
+	
+	// 调用注册的处理器
+	for _, handler := range rbr.handlers {
+		if err := handler.HandleBatch(batch); err != nil {
+			// 记录错误，但继续处理
+			fmt.Printf("Handler error: %v\n", err)
+		}
+	}
 }
 
 // AttachNetworkPrograms 附加网络监控程序到指定接口
@@ -223,6 +490,17 @@ func (nl *NetworkLoader) GetTcDeviceStatsMap() *ebpf.Map {
 func (nl *NetworkLoader) Close() error {
 	var lastErr error
 
+	// 停止 Ring Buffer 读取
+	if nl.ringbufReader != nil {
+		nl.ringbufReader.cancel()
+		if nl.ringbufReader.reader != nil {
+			if err := nl.ringbufReader.reader.Close(); err != nil {
+				fmt.Printf("⚠️  Error closing ring buffer reader: %v\n", err)
+				lastErr = err
+			}
+		}
+	}
+
 	// 关闭所有链接
 	for _, l := range nl.links {
 		if err := l.Close(); err != nil {
@@ -237,8 +515,39 @@ func (nl *NetworkLoader) Close() error {
 		lastErr = err
 	}
 
-	fmt.Println("🧹 Network loader closed")
 	return lastErr
+}
+
+// GetRingBufferStats 获取 Ring Buffer 统计信息
+func (nl *NetworkLoader) GetRingBufferStats() map[string]uint64 {
+	if nl.ringbufReader == nil {
+		return nil
+	}
+	
+	return map[string]uint64{
+		"events_read":       nl.ringbufReader.eventsRead,
+		"events_dropped":    nl.ringbufReader.eventsDropped,
+		"batches_processed": nl.ringbufReader.batchesProcessed,
+	}
+}
+
+// 辅助函数
+func intToIP(ip uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d",
+		ip&0xFF, (ip>>8)&0xFF, (ip>>16)&0xFF, ip>>24)
+}
+
+func getProtocolName(proto uint8) string {
+	switch proto {
+	case 1:
+		return "ICMP"
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	default:
+		return fmt.Sprintf("Proto-%d", proto)
+	}
 }
 
 // GlobalStats 全局统计信息

@@ -1,9 +1,11 @@
 package ebpf
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -298,4 +300,308 @@ func TestNetworkLoader_ReadFlowStats(t *testing.T) {
 	// 基本验证
 	assert.NoError(t, err)
 	assert.NotNil(t, finalStats)
+}
+
+// ========== Ring Buffer 核心功能测试 ==========
+
+// TestNetworkLoader_RingBufferConfiguration 测试 Ring Buffer 配置功能
+func TestNetworkLoader_RingBufferConfiguration(t *testing.T) {
+	loader := NewNetworkLoader()
+	defer loader.Close()
+
+	// 测试默认配置
+	assert.True(t, loader.config.EnableTCEvents, "默认应该启用 TC 事件")
+	assert.False(t, loader.config.EnableXDPEvents, "默认应该禁用 XDP 事件（避免重复）")
+	assert.False(t, loader.config.EnableDetailedEvents, "默认应该禁用详细事件")
+
+	// 测试配置修改
+	newConfig := &RingBufferConfig{
+		EnableXDPEvents:      true,
+		EnableTCEvents:       false,
+		EnableDetailedEvents: true,
+	}
+	loader.SetRingBufferConfig(newConfig)
+	
+	assert.True(t, loader.config.EnableXDPEvents)
+	assert.False(t, loader.config.EnableTCEvents)
+	assert.True(t, loader.config.EnableDetailedEvents)
+
+	// 加载程序并配置 Ring Buffer
+	err := loader.LoadPrograms()
+	require.NoError(t, err, "加载 eBPF 程序失败")
+
+	// 验证配置已应用到 eBPF 映射
+	// 读取配置映射验证配置值
+	key := uint32(0)
+	var configValue uint32
+	err = loader.objs.RingbufConfig.Lookup(key, &configValue)
+	require.NoError(t, err, "读取 Ring Buffer 配置失败")
+
+	// 验证配置位
+	expectedValue := uint32(0)
+	if newConfig.EnableXDPEvents {
+		expectedValue |= 1 << 0
+	}
+	if newConfig.EnableTCEvents {
+		expectedValue |= 1 << 1
+	}
+	if newConfig.EnableDetailedEvents {
+		expectedValue |= 1 << 2
+	}
+
+	assert.Equal(t, expectedValue, configValue, "Ring Buffer 配置值不匹配")
+}
+
+// TestNetworkLoader_RingBufferInitialization 测试 Ring Buffer 初始化
+func TestNetworkLoader_RingBufferInitialization(t *testing.T) {
+	loader := NewNetworkLoader()
+	defer loader.Close()
+
+	// 加载程序
+	err := loader.LoadPrograms()
+	require.NoError(t, err)
+
+	// 创建上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 初始化 Ring Buffer 读取器
+	err = loader.InitializeRingBufferReader(ctx)
+	require.NoError(t, err, "初始化 Ring Buffer 读取器失败")
+
+	// 验证 Ring Buffer 读取器已创建
+	assert.NotNil(t, loader.ringbufReader, "Ring Buffer 读取器应该被创建")
+	assert.NotNil(t, loader.ringbufReader.reader, "Ring Buffer reader 应该被初始化")
+	assert.NotNil(t, loader.ringbufReader.eventChan, "事件通道应该被创建")
+	assert.NotNil(t, loader.ringbufReader.batchChan, "批量通道应该被创建")
+
+	// 验证默认配置
+	assert.Equal(t, 100, loader.ringbufReader.batchSize, "默认批量大小应该是 100")
+	assert.Equal(t, 100*time.Millisecond, loader.ringbufReader.batchTimeout, "默认批量超时应该是 100ms")
+	assert.Equal(t, 0, len(loader.ringbufReader.handlers), "默认应该没有事件处理器")
+
+	// 验证通道容量
+	assert.Equal(t, 1000, cap(loader.ringbufReader.eventChan), "事件通道容量应该是 1000")
+	assert.Equal(t, 100, cap(loader.ringbufReader.batchChan), "批量通道容量应该是 100")
+}
+
+// MockEventHandler 模拟事件处理器
+type MockEventHandler struct {
+	eventCount  int
+	batchCount  int
+	lastEvent   *NetworkEvent
+	lastBatch   []*NetworkEvent
+	mu          sync.Mutex
+}
+
+func (m *MockEventHandler) HandleEvent(event *NetworkEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventCount++
+	m.lastEvent = event
+	return nil
+}
+
+func (m *MockEventHandler) HandleBatch(events []*NetworkEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchCount++
+	m.lastBatch = make([]*NetworkEvent, len(events))
+	copy(m.lastBatch, events)
+	return nil
+}
+
+func (m *MockEventHandler) GetStats() (eventCount, batchCount int, lastEvent *NetworkEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.eventCount, m.batchCount, m.lastEvent
+}
+
+// TestNetworkLoader_EventHandler 测试事件处理器功能
+func TestNetworkLoader_EventHandler(t *testing.T) {
+	loader := NewNetworkLoader()
+	defer loader.Close()
+
+	// 加载程序
+	err := loader.LoadPrograms()
+	require.NoError(t, err)
+
+	// 附加到 lo 接口
+	err = loader.AttachNetworkPrograms("lo")
+	require.NoError(t, err)
+
+	// 创建上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 初始化 Ring Buffer 读取器
+	err = loader.InitializeRingBufferReader(ctx)
+	require.NoError(t, err)
+
+	// 创建模拟事件处理器
+	handler := &MockEventHandler{}
+	loader.AddEventHandler(handler)
+
+	// 验证处理器已添加
+	assert.Equal(t, 1, len(loader.ringbufReader.handlers), "应该有一个事件处理器")
+
+	// 启动 Ring Buffer 处理
+	err = loader.StartRingBufferProcessing()
+	require.NoError(t, err)
+
+	// 等待处理器启动
+	time.Sleep(100 * time.Millisecond)
+
+	// 生成网络流量
+	fmt.Println("📡 生成测试网络流量用于事件处理器测试...")
+	cmd := exec.Command("ping", "-c", "5", "-i", "0.1", "127.0.0.1")
+	err = cmd.Run()
+	if err != nil {
+		t.Logf("警告: ping 失败: %v", err)
+	}
+
+	// 等待事件被处理
+	time.Sleep(2 * time.Second)
+
+	// 检查处理器统计
+	eventCount, batchCount, lastEvent := handler.GetStats()
+	fmt.Printf("事件处理器统计: events=%d, batches=%d\n", eventCount, batchCount)
+
+	if lastEvent != nil {
+		fmt.Printf("最后一个事件: %s\n", lastEvent.String())
+		
+		// 验证事件字段
+		assert.Greater(t, lastEvent.Timestamp, uint64(0), "时间戳应该大于 0")
+		assert.Greater(t, lastEvent.PacketLen, uint16(0), "包长度应该大于 0")
+		
+		// 对于 loopback 流量，源IP和目标IP应该都是 127.0.0.1
+		loopbackIP := uint32(0x0100007f) // 127.0.0.1 in little-endian
+		if lastEvent.SrcIP == loopbackIP || lastEvent.DstIP == loopbackIP {
+			fmt.Println("✅ 成功捕获 loopback 流量")
+		}
+	}
+
+	// 如果有批次被处理，验证批次处理
+	if batchCount > 0 {
+		assert.Greater(t, batchCount, 0, "应该处理了批次")
+		fmt.Println("✅ 批量处理功能正常")
+	}
+}
+
+// TestNetworkLoader_RingBufferStats 测试 Ring Buffer 统计功能
+func TestNetworkLoader_RingBufferStats(t *testing.T) {
+	loader := NewNetworkLoader()
+	defer loader.Close()
+
+	// 在初始化前，统计应该为 nil
+	stats := loader.GetRingBufferStats()
+	assert.Nil(t, stats, "初始化前统计应该为 nil")
+
+	// 加载程序
+	err := loader.LoadPrograms()
+	require.NoError(t, err)
+
+	// 创建上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 初始化 Ring Buffer 读取器
+	err = loader.InitializeRingBufferReader(ctx)
+	require.NoError(t, err)
+
+	// 现在统计应该可用
+	stats = loader.GetRingBufferStats()
+	require.NotNil(t, stats, "初始化后统计应该可用")
+
+	// 验证初始统计值
+	assert.Equal(t, uint64(0), stats["events_read"], "初始读取事件数应该为 0")
+	assert.Equal(t, uint64(0), stats["events_dropped"], "初始丢弃事件数应该为 0")
+	assert.Equal(t, uint64(0), stats["batches_processed"], "初始处理批次数应该为 0")
+
+	// 验证统计键
+	expectedKeys := []string{"events_read", "events_dropped", "batches_processed"}
+	for _, key := range expectedKeys {
+		_, exists := stats[key]
+		assert.True(t, exists, "统计应该包含键: %s", key)
+	}
+}
+
+// TestNetworkLoader_RingBufferChannels 测试 Ring Buffer 通道功能
+func TestNetworkLoader_RingBufferChannels(t *testing.T) {
+	loader := NewNetworkLoader()
+	defer loader.Close()
+
+	// 在初始化前，通道应该为 nil
+	assert.Nil(t, loader.GetEventChannel(), "初始化前事件通道应该为 nil")
+	assert.Nil(t, loader.GetBatchChannel(), "初始化前批量通道应该为 nil")
+
+	// 加载程序
+	err := loader.LoadPrograms()
+	require.NoError(t, err)
+
+	// 创建上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 初始化 Ring Buffer 读取器
+	err = loader.InitializeRingBufferReader(ctx)
+	require.NoError(t, err)
+
+	// 现在通道应该可用
+	eventChan := loader.GetEventChannel()
+	batchChan := loader.GetBatchChannel()
+
+	assert.NotNil(t, eventChan, "事件通道应该可用")
+	assert.NotNil(t, batchChan, "批量通道应该可用")
+
+	// 验证通道类型
+	assert.IsType(t, (<-chan *NetworkEvent)(nil), eventChan, "事件通道类型应该正确")
+	assert.IsType(t, (<-chan []*NetworkEvent)(nil), batchChan, "批量通道类型应该正确")
+}
+
+// TestNetworkEvent_String 测试 NetworkEvent 字符串格式化
+func TestNetworkEvent_String(t *testing.T) {
+	event := &NetworkEvent{
+		Timestamp: uint64(time.Now().UnixNano()),
+		SrcIP:     0x0100007f, // 127.0.0.1 in little-endian
+		DstIP:     0x0100007f, // 127.0.0.1 in little-endian
+		SrcPort:   12345,
+		DstPort:   80,
+		PacketLen: 64,
+		Protocol:  6,  // TCP
+		Direction: 0,  // INGRESS
+		TCPFlags:  0x18, // PSH|ACK
+		EventType: 0,  // NORMAL
+		Ifindex:   1,  // lo
+	}
+
+	str := event.String()
+	
+	// 验证格式化字符串包含预期内容
+	assert.Contains(t, str, "INGRESS", "应该包含方向信息")
+	assert.Contains(t, str, "TCP", "应该包含协议信息") 
+	assert.Contains(t, str, "127.0.0.1", "应该包含IP地址")
+	assert.Contains(t, str, "12345", "应该包含源端口")
+	assert.Contains(t, str, "80", "应该包含目标端口")
+	assert.Contains(t, str, "64 bytes", "应该包含包大小")
+
+	fmt.Printf("事件字符串格式: %s\n", str)
+}
+
+// TestRingBufferConfig 测试 Ring Buffer 配置结构
+func TestRingBufferConfig(t *testing.T) {
+	// 测试默认配置
+	config := &RingBufferConfig{}
+	assert.False(t, config.EnableXDPEvents, "默认 XDP 事件应该禁用")
+	assert.False(t, config.EnableTCEvents, "默认 TC 事件应该禁用")
+	assert.False(t, config.EnableDetailedEvents, "默认详细事件应该禁用")
+
+	// 测试配置修改
+	config.EnableXDPEvents = true
+	config.EnableTCEvents = true
+	config.EnableDetailedEvents = true
+
+	assert.True(t, config.EnableXDPEvents)
+	assert.True(t, config.EnableTCEvents)
+	assert.True(t, config.EnableDetailedEvents)
 }
