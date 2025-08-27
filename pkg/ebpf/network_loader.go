@@ -163,6 +163,11 @@ func (nl *NetworkLoader) ReadGlobalStats() (*GlobalStats, error) {
 func (nl *NetworkLoader) ReadTCDeviceStats() (map[TCDeviceKey]uint64, error) {
 	stats := make(map[TCDeviceKey]uint64)
 
+	// 检查 TC 设备统计 Map 是否已初始化
+	if nl.objs.TcDeviceStats == nil {
+		return nil, fmt.Errorf("TC device stats map is not initialized - call LoadPrograms() first")
+	}
+
 	// 遍历 TC 设备统计 Map
 	var key TCDeviceKey
 	var value uint64
