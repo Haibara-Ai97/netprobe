@@ -81,6 +81,33 @@ struct {
     __uint(max_entries, 1024);
 } tc_device_stats SEC(".maps");
 
+// Rate limiting map for DDoS protection
+// Key: source IP, Value: last seen timestamp
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 65536);
+} rate_limit_map SEC(".maps");
+
+// Load balancer statistics
+// Key: target interface, Value: packet count
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 16);
+} lb_stats SEC(".maps");
+
+// Blacklist map for security filtering
+// Key: IP address, Value: block timestamp
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 10240);
+} blacklist_map SEC(".maps");
+
 // 统计键定义
 #define STAT_RX_PACKETS     0
 #define STAT_TX_PACKETS     1
@@ -90,6 +117,12 @@ struct {
 #define STAT_EVENTS_DROPPED 5
 #define STAT_BUFFER_FULL    6
 #define STAT_PARSE_ERRORS   7
+#define STAT_XDP_DROP       8
+#define STAT_XDP_PASS       9
+#define STAT_XDP_REDIRECT   10
+#define STAT_DDOS_BLOCKED   11
+#define STAT_LB_DECISIONS   12
+#define STAT_SECURITY_EVENTS 13
 
 // TC 统计类型
 #define TC_STAT_PACKETS  0
@@ -103,16 +136,26 @@ struct {
 #define EVENT_TYPE_NORMAL    0
 #define EVENT_TYPE_ANOMALY   1
 #define EVENT_TYPE_SECURITY  2
+#define EVENT_TYPE_DDOS      3
+#define EVENT_TYPE_LOAD_BALANCE 4
 
 // Hook 位置定义
 #define HOOK_XDP        1
 #define HOOK_TC_INGRESS 2  
 #define HOOK_TC_EGRESS  3
 
+// DDoS 检测阈值
+#define DDOS_RATE_LIMIT_NS   1000000    // 1ms between packets
+#define DDOS_PACKET_THRESHOLD 1000      // Max packets per time window
+#define BLACKLIST_DURATION_NS 60000000000ULL // 60 seconds
+
 // 前向声明
 static inline void update_stats(__u32 key, __u64 value);
 static inline void update_flow_stats(struct flow_key *key);
 static inline void update_tc_device_stats(__u32 ifindex, __u32 direction, __u32 stat_type, __u64 value);
+static inline int check_rate_limit(__u32 src_ip);
+static inline int check_blacklist(__u32 src_ip);
+static inline void add_to_blacklist(__u32 src_ip);
 
 // Ring Buffer 配置映射
 struct {
@@ -259,6 +302,59 @@ static inline void update_flow_stats(struct flow_key *key) {
     }
 }
 
+// Helper function: Check rate limiting for DDoS protection
+static inline int check_rate_limit(__u32 src_ip) {
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last_seen = bpf_map_lookup_elem(&rate_limit_map, &src_ip);
+    
+    if (last_seen) {
+        if (now - *last_seen < DDOS_RATE_LIMIT_NS) {
+            // Rate limit exceeded
+            return 1;
+        }
+    }
+    
+    // Update timestamp
+    bpf_map_update_elem(&rate_limit_map, &src_ip, &now, BPF_ANY);
+    return 0;
+}
+
+// Helper function: Check if IP is blacklisted
+static inline int check_blacklist(__u32 src_ip) {
+    __u64 *blocked_time = bpf_map_lookup_elem(&blacklist_map, &src_ip);
+    if (!blocked_time) {
+        return 0; // Not blacklisted
+    }
+    
+    __u64 now = bpf_ktime_get_ns();
+    if (now - *blocked_time > BLACKLIST_DURATION_NS) {
+        // Blacklist expired, remove entry
+        bpf_map_delete_elem(&blacklist_map, &src_ip);
+        return 0;
+    }
+    
+    return 1; // Still blacklisted
+}
+
+// Helper function: Add IP to blacklist
+static inline void add_to_blacklist(__u32 src_ip) {
+    __u64 now = bpf_ktime_get_ns();
+    bpf_map_update_elem(&blacklist_map, &src_ip, &now, BPF_ANY);
+    update_stats(STAT_DDOS_BLOCKED, 1);
+}
+
+// Helper function: Update load balancer statistics
+static inline void update_lb_stats(__u32 target_if) {
+    __u64 *count_ptr = bpf_map_lookup_elem(&lb_stats, &target_if);
+    if (count_ptr) {
+        __sync_fetch_and_add(count_ptr, 1);
+    } else {
+        __u64 initial_count = 1;
+        bpf_map_update_elem(&lb_stats, &target_if, &initial_count, BPF_ANY);
+    }
+    update_stats(STAT_LB_DECISIONS, 1);
+}
+
 // XDP Network Monitor Program with Ring Buffer Support
 // Attached to network interface for high-performance packet processing
 // Processes packets at the earliest point in the network stack
@@ -292,6 +388,156 @@ int network_monitor_xdp(struct xdp_md *ctx) {
     update_stats(STAT_RX_PACKETS, 1);
     update_stats(STAT_RX_BYTES, event.packet_len);
     update_flow_stats(&flow_key);
+    
+    return XDP_PASS;
+}
+
+// Advanced XDP Filter with DDoS Protection
+// High-performance packet filtering and attack detection
+SEC("xdp/advanced_filter")
+int xdp_advanced_filter(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+    struct ethhdr *eth = data;
+    
+    // Validate Ethernet header
+    if ((void *)(eth + 1) > data_end) {
+        update_stats(STAT_PARSE_ERRORS, 1);
+        return XDP_ABORTED;
+    }
+    
+    // Only process IPv4 packets
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+        return XDP_PASS;
+    }
+    
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) {
+        update_stats(STAT_PARSE_ERRORS, 1);
+        return XDP_ABORTED;
+    }
+    
+    __u32 src_ip = ip->saddr;
+    
+    // Check blacklist first
+    if (check_blacklist(src_ip)) {
+        update_stats(STAT_XDP_DROP, 1);
+        return XDP_DROP;
+    }
+    
+    // Check rate limiting for DDoS protection
+    if (check_rate_limit(src_ip)) {
+        // Add to blacklist after repeated violations
+        add_to_blacklist(src_ip);
+        update_stats(STAT_XDP_DROP, 1);
+        return XDP_DROP;
+    }
+    
+    // Parse packet and create event
+    struct network_event event = {0};
+    if (parse_packet_to_event(data, data_end, &event, ctx->ingress_ifindex, TC_DIRECTION_INGRESS) < 0) {
+        update_stats(STAT_PARSE_ERRORS, 1);
+        return XDP_PASS;
+    }
+    
+    // Check for suspicious patterns
+    if (event.packet_len < 64) {
+        // Potential attack packet (too small)
+        event.event_type = EVENT_TYPE_SECURITY;
+        send_network_event(&event);
+        update_stats(STAT_SECURITY_EVENTS, 1);
+        add_to_blacklist(src_ip);
+        update_stats(STAT_XDP_DROP, 1);
+        return XDP_DROP;
+    }
+    
+    // Protocol-specific filtering
+    if (event.protocol == IPPROTO_ICMP) {
+        // Limit ICMP rate to prevent ping floods
+        __u32 icmp_key = STAT_SECURITY_EVENTS + 1; // Use unused stat key
+        __u64 *icmp_count = bpf_map_lookup_elem(&packet_stats, &icmp_key);
+        if (icmp_count && *icmp_count > 100) { // Max 100 ICMP per time window
+            event.event_type = EVENT_TYPE_DDOS;
+            send_network_event(&event);
+            update_stats(STAT_XDP_DROP, 1);
+            return XDP_DROP;
+        }
+        update_stats(icmp_key, 1);
+    }
+    
+    // Send event for monitoring
+    if (should_send_event(HOOK_XDP)) {
+        send_network_event(&event);
+    }
+    
+    // Update statistics
+    update_stats(STAT_RX_PACKETS, 1);
+    update_stats(STAT_RX_BYTES, event.packet_len);
+    update_stats(STAT_XDP_PASS, 1);
+    
+    return XDP_PASS;
+}
+
+// XDP Load Balancer Program
+// Distributes packets across multiple interfaces or queues
+SEC("xdp/load_balancer")
+int xdp_load_balancer(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+    struct ethhdr *eth = data;
+    
+    // Validate Ethernet header
+    if ((void *)(eth + 1) > data_end) {
+        return XDP_PASS;
+    }
+    
+    // Only balance IPv4 packets
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+        return XDP_PASS;
+    }
+    
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) {
+        return XDP_PASS;
+    }
+    
+    // Simple hash-based load balancing
+    __u32 hash = 0;
+    hash ^= ip->saddr;
+    hash ^= ip->daddr;
+    
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+        if ((void *)(tcp + 1) <= data_end) {
+            hash ^= tcp->source;
+            hash ^= tcp->dest;
+        }
+    } else if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = (void *)ip + (ip->ihl * 4);
+        if ((void *)(udp + 1) <= data_end) {
+            hash ^= udp->source;
+            hash ^= udp->dest;
+        }
+    }
+    
+    // Calculate target interface (assuming 4 interfaces for load balancing)
+    __u32 target_if = hash % 4;
+    
+    // Update load balancer statistics
+    update_lb_stats(target_if);
+    
+    // Log load balancing decision
+    struct network_event event = {0};
+    if (parse_packet_to_event(data, data_end, &event, ctx->ingress_ifindex, TC_DIRECTION_INGRESS) >= 0) {
+        event.event_type = EVENT_TYPE_LOAD_BALANCE;
+        // Store target interface in ifindex field for debugging
+        event.ifindex = target_if;
+        send_network_event(&event);
+    }
+    
+    // For demonstration, we'll just pass the packet
+    // In real implementation, you would use bpf_redirect() to target interface
+    // return bpf_redirect(target_if, 0);
     
     return XDP_PASS;
 }
