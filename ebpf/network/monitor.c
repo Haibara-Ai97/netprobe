@@ -57,6 +57,7 @@ struct {
 } events SEC(".maps");
 
 // Simple packet counter array map for basic statistics
+// 全局流量统计map
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(key_size, sizeof(__u32));
@@ -65,6 +66,7 @@ struct {
 } packet_stats SEC(".maps");
 
 // Hash map for per-flow statistics tracking
+// 流级别流量统计
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(struct flow_key));

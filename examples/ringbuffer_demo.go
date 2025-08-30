@@ -32,7 +32,7 @@ func (h *SimpleEventHandler) HandleBatch(events []*ebpf.NetworkEvent) error {
 	for _, event := range events {
 		atomic.AddInt64(&h.eventCount, 1)
 		atomic.AddInt64(&h.byteCount, int64(event.PacketLen))
-		
+
 		// 每1000个事件显示一次详细信息
 		if atomic.LoadInt64(&h.eventCount)%1000 == 0 {
 			fmt.Printf("📦 Sample Event: %s\n", event.String())
@@ -45,12 +45,12 @@ func (h *SimpleEventHandler) HandleBatch(events []*ebpf.NetworkEvent) error {
 func (h *SimpleEventHandler) displayStats() {
 	events := atomic.LoadInt64(&h.eventCount)
 	bytes := atomic.LoadInt64(&h.byteCount)
-	
+
 	fmt.Printf("\n📊 Ring Buffer Statistics:\n")
 	fmt.Printf("==========================================\n")
 	fmt.Printf("Events Processed: %d\n", events)
 	fmt.Printf("Bytes Processed:  %s\n", formatBytes(uint64(bytes)))
-	
+
 	// 计算速率
 	now := time.Now()
 	if !h.lastDisplay.IsZero() {
@@ -130,7 +130,7 @@ func main() {
 				return
 			case <-ticker.C:
 				handler.displayStats()
-				
+
 				// 显示 Ring Buffer 内部统计
 				stats := loader.GetRingBufferStats()
 				if stats != nil {
@@ -138,7 +138,7 @@ func main() {
 					fmt.Printf("  Events Read:       %d\n", stats["events_read"])
 					fmt.Printf("  Events Dropped:    %d\n", stats["events_dropped"])
 					fmt.Printf("  Batches Processed: %d\n", stats["batches_processed"])
-					
+
 					if stats["events_read"] > 0 {
 						dropRate := float64(stats["events_dropped"]) / float64(stats["events_read"]) * 100
 						fmt.Printf("  Drop Rate:         %.2f%%\n", dropRate)
@@ -180,7 +180,7 @@ func main() {
 	// 等待信号
 	<-sigChan
 	fmt.Println("\n🛑 Shutting down...")
-	
+
 	// 最后显示一次统计
 	handler.displayStats()
 	stats := loader.GetRingBufferStats()
@@ -190,18 +190,4 @@ func main() {
 		fmt.Printf("  Total Events Dropped: %d\n", stats["events_dropped"])
 		fmt.Printf("  Total Batches: %d\n", stats["batches_processed"])
 	}
-}
-
-// 格式化字节数
-func formatBytes(bytes uint64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
