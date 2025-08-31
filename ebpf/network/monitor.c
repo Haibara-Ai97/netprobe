@@ -44,6 +44,8 @@ struct network_event {
     __u8  direction;    // Traffic direction: 0=ingress, 1=egress
     __u8  tcp_flags;    // TCP flags (if TCP packet)
     __u8  event_type;   // Event type: 0=normal, 1=anomaly, 2=security
+    __u8  hook_point;   // Hook point: 1=XDP, 2=TC_INGRESS, 3=TC_EGRESS, 4=NETFILTER, 5=SOCKET
+    __u8  pad[3];       // Padding for alignment
     __u32 ifindex;      // Network interface index
 } __attribute__((packed));
 
@@ -142,9 +144,11 @@ struct {
 #define EVENT_TYPE_LOAD_BALANCE 4
 
 // Hook 位置定义
-#define HOOK_XDP        1
-#define HOOK_TC_INGRESS 2  
-#define HOOK_TC_EGRESS  3
+#define HOOK_XDP           1
+#define HOOK_TC_INGRESS    2  
+#define HOOK_TC_EGRESS     3
+#define HOOK_NETFILTER     4  // 为将来的Netfilter hook预留
+#define HOOK_SOCKET        5  // 为将来的Socket hook预留
 
 // DDoS 检测阈值
 #define DDOS_RATE_LIMIT_NS   1000000    // 1ms between packets
@@ -214,9 +218,17 @@ static inline int send_network_event(struct network_event *event) {
     return 0;
 }
 
+// Packet parsing context
+struct parse_context {
+    __u32 ifindex;
+    __u8 direction;
+    __u8 hook_point;
+};
+
 // Helper function: Parse packet headers into event structure
 static inline int parse_packet_to_event(void *data, void *data_end, 
-                                       struct network_event *event, __u32 ifindex, __u8 direction) {
+                                       struct network_event *event, 
+                                       struct parse_context *ctx) {
     struct ethhdr *eth = data;
     
     // Validate Ethernet header
@@ -240,9 +252,10 @@ static inline int parse_packet_to_event(void *data, void *data_end,
     event->dst_ip = ip->daddr;
     event->protocol = ip->protocol;
     event->packet_len = bpf_ntohs(ip->tot_len);
-    event->direction = direction;
+    event->direction = ctx->direction;
     event->event_type = EVENT_TYPE_NORMAL;
-    event->ifindex = ifindex;
+    event->hook_point = ctx->hook_point;  // 添加hook点信息
+    event->ifindex = ctx->ifindex;
     event->tcp_flags = 0;
     event->src_port = 0;
     event->dst_port = 0;
@@ -367,7 +380,12 @@ int network_monitor_xdp(struct xdp_md *ctx) {
     
     // Parse packet and create event
     struct network_event event = {0};
-    if (parse_packet_to_event(data, data_end, &event, ctx->ingress_ifindex, TC_DIRECTION_INGRESS) < 0) {
+    struct parse_context parse_ctx = {
+        .ifindex = ctx->ingress_ifindex,
+        .direction = TC_DIRECTION_INGRESS,
+        .hook_point = HOOK_XDP
+    };
+    if (parse_packet_to_event(data, data_end, &event, &parse_ctx) < 0) {
         update_stats(STAT_PARSE_ERRORS, 1);
         return XDP_PASS;
     }
@@ -437,7 +455,12 @@ int xdp_advanced_filter(struct xdp_md *ctx) {
     
     // Parse packet and create event
     struct network_event event = {0};
-    if (parse_packet_to_event(data, data_end, &event, ctx->ingress_ifindex, TC_DIRECTION_INGRESS) < 0) {
+    struct parse_context parse_ctx = {
+        .ifindex = ctx->ingress_ifindex,
+        .direction = TC_DIRECTION_INGRESS,
+        .hook_point = HOOK_XDP
+    };
+    if (parse_packet_to_event(data, data_end, &event, &parse_ctx) < 0) {
         update_stats(STAT_PARSE_ERRORS, 1);
         return XDP_PASS;
     }
@@ -530,7 +553,12 @@ int xdp_load_balancer(struct xdp_md *ctx) {
     
     // Log load balancing decision
     struct network_event event = {0};
-    if (parse_packet_to_event(data, data_end, &event, ctx->ingress_ifindex, TC_DIRECTION_INGRESS) >= 0) {
+    struct parse_context parse_ctx = {
+        .ifindex = ctx->ingress_ifindex,
+        .direction = TC_DIRECTION_INGRESS,
+        .hook_point = HOOK_TC_INGRESS
+    };
+    if (parse_packet_to_event(data, data_end, &event, &parse_ctx) >= 0) {
         event.event_type = EVENT_TYPE_LOAD_BALANCE;
         // Store target interface in ifindex field for debugging
         event.ifindex = target_if;
@@ -554,7 +582,12 @@ int network_monitor_tc_egress(struct __sk_buff *skb) {
     
     // Parse packet and create event
     struct network_event event = {0};
-    if (parse_packet_to_event(data, data_end, &event, skb->ifindex, TC_DIRECTION_EGRESS) < 0) {
+    struct parse_context parse_ctx = {
+        .ifindex = skb->ifindex,
+        .direction = TC_DIRECTION_EGRESS,
+        .hook_point = HOOK_TC_EGRESS
+    };
+    if (parse_packet_to_event(data, data_end, &event, &parse_ctx) < 0) {
         update_stats(STAT_PARSE_ERRORS, 1);
         return TC_ACT_OK;
     }
@@ -597,7 +630,12 @@ int network_monitor_tc_ingress(struct __sk_buff *skb) {
     
     // Parse packet and create event
     struct network_event event = {0};
-    if (parse_packet_to_event(data, data_end, &event, skb->ifindex, TC_DIRECTION_INGRESS) < 0) {
+    struct parse_context parse_ctx = {
+        .ifindex = skb->ifindex,
+        .direction = TC_DIRECTION_INGRESS,
+        .hook_point = HOOK_TC_INGRESS
+    };
+    if (parse_packet_to_event(data, data_end, &event, &parse_ctx) < 0) {
         update_stats(STAT_PARSE_ERRORS, 1);
         return TC_ACT_OK;
     }

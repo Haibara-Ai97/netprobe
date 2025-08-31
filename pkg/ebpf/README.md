@@ -1,53 +1,179 @@
 # eBPF Package
 
-这个包使用 `bpf2go` 生成的代码来加载和管理 eBPF 网络监控程序。
+这个包提供了一个结构化的 eBPF 网络监控框架，使用 `bpf2go` 生成的代码来加载和管理 eBPF 程序。
 
-## 文件说明
+## 快速开始
 
-### network_loader.go (主要组件)
-使用 `bpf2go` 生成的代码来加载网络监控程序。提供：
-- 类型安全的 Go 结构体
-- 自动生成的 Map 和 Program 定义
-- 简化的 API 接口
-
-### manager.go
-统一的管理器，提供高级的 eBPF 程序管理功能。
-
-### example.go
-使用示例和演示代码。
-
-## 使用方法
-
-### 1. 直接使用 NetworkLoader
+### 基本使用
 
 ```go
 package main
 
 import (
-    "github.com/your-org/kube-net-probe/pkg/ebpf"
+    "log"
+    "time"
+    "github.com/Haibara-Ai97/netprobe/pkg/ebpf"
 )
 
 func main() {
-    // 创建网络加载器
-    loader := ebpf.NewNetworkLoader()
-    defer loader.Close()
+    // 创建管理器
+    manager := ebpf.NewManager()
+    defer manager.Close()
 
-    // 加载程序
-    if err := loader.LoadPrograms(); err != nil {
-        panic(err)
+    // 加载 eBPF 程序
+    if err := manager.LoadNetworkMonitor(); err != nil {
+        log.Fatal("Failed to load eBPF programs:", err)
     }
 
     // 附加到网络接口
-    if err := loader.AttachNetworkPrograms("eth0"); err != nil {
-        panic(err)
+    if err := manager.AttachNetworkMonitor("eth0"); err != nil {
+        log.Fatal("Failed to attach to interface:", err)
     }
 
-    // 读取统计信息
-    stats, err := loader.ReadGlobalStats()
-    if err != nil {
-        panic(err)
+    // 监控 30 秒
+    time.Sleep(30 * time.Second)
+
+    // 获取统计信息
+    if stats, err := manager.GetGlobalStats(); err == nil {
+        log.Printf("Network Stats: %s", stats.String())
     }
-    
+}
+```
+
+### 高级配置
+
+```go
+// 创建自定义配置
+config := ebpf.DefaultManagerConfig()
+config.XDPMode = ebpf.XDPAdvancedFilter
+config.EnableSecurityAlerts = true
+config.EnableDetailedEvents = true
+
+// 使用配置创建管理器
+manager := ebpf.NewManagerWithConfig(config)
+```
+
+## 文件说明
+
+### 核心文件
+
+- **`manager.go`**: 高级管理接口，提供统一的 eBPF 程序管理
+- **`loader.go`**: 底层 eBPF 程序加载和附加逻辑
+- **`event_handlers.go`**: 事件处理器实现
+- **`types.go`**: 类型定义和接口
+- **`ringbuffer.go`**: Ring Buffer 数据处理
+- **`utils.go`**: 工具函数
+
+### 支持文件
+
+- **`ARCHITECTURE.md`**: 详细的架构文档
+- **`network_loader_test.go`**: 测试文件
+
+## 主要特性
+
+### 1. 分层架构
+- **Manager**: 高级管理接口
+- **NetworkLoader**: eBPF 程序加载器
+- **EventHandlers**: 事件处理逻辑
+- **RingBuffer**: 数据流处理
+
+### 2. 多种 XDP 模式
+- **Basic Monitor**: 基础网络监控
+- **Advanced Filter**: 高级过滤和安全检测
+- **Load Balancer**: 负载均衡功能
+
+### 3. 事件处理
+- **安全事件**: DDoS 检测、异常检测
+- **负载均衡**: 流量分发统计
+- **统计事件**: 网络流量统计
+
+### 4. 实时监控
+- Ring Buffer 批处理
+- 实时统计报告
+- 黑名单管理
+
+## API 文档
+
+### Manager 接口
+
+```go
+// 基本操作
+manager := NewManager()
+err := manager.LoadNetworkMonitor()
+err := manager.AttachNetworkMonitor("eth0")
+err := manager.DetachNetworkMonitor()
+manager.Close()
+
+// 统计信息
+stats, err := manager.GetGlobalStats()
+secStats, err := manager.GetSecurityStats()
+lbStats, err := manager.GetLoadBalancerStats()
+
+// 黑名单管理
+err := manager.AddIPToBlacklist("192.168.1.100")
+err := manager.RemoveIPFromBlacklist("192.168.1.100")
+ips, err := manager.GetBlacklistedIPs()
+
+// 配置管理
+manager.UpdateConfig(newConfig)
+config := manager.GetConfig()
+```
+
+### 配置选项
+
+```go
+type ManagerConfig struct {
+    XDPMode              XDPProgramType // XDP 程序类型
+    EnableXDPEvents      bool           // 启用 XDP 事件
+    EnableTCEvents       bool           // 启用 TC 事件
+    EnableDetailedEvents bool           // 启用详细事件
+    BatchSize            int            // 批处理大小
+    BatchTimeout         time.Duration  // 批处理超时
+    StatsReportInterval  time.Duration  // 统计报告间隔
+    EnableSecurityAlerts bool           // 启用安全告警
+}
+```
+
+## 系统要求
+
+- Linux 内核 5.4+ (支持 eBPF)
+- CAP_BPF 或 root 权限
+- 支持 XDP 的网络接口
+
+## 错误处理
+
+包提供了完整的错误处理机制：
+
+```go
+// 检查系统支持
+if !ebpf.IsSupported() {
+    log.Fatal("eBPF is not supported on this system")
+}
+
+// 错误处理示例
+if err := manager.LoadNetworkMonitor(); err != nil {
+    log.Printf("Failed to load programs: %v", err)
+    return
+}
+```
+
+## 性能考虑
+
+- Ring Buffer 使用批处理减少系统调用
+- 事件处理器并行处理
+- 内存映射减少数据拷贝
+- 自动清理过期数据
+
+## 调试
+
+启用详细日志以获取更多调试信息：
+
+```go
+config := ebpf.DefaultManagerConfig()
+config.EnableDetailedEvents = true
+```
+
+查看详细架构文档：[ARCHITECTURE.md](./ARCHITECTURE.md)
     fmt.Println(stats.String())
 }
 ```

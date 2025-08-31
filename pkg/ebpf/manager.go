@@ -4,408 +4,353 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"runtime"
+	"sync"
 	"time"
-
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/features"
-	"github.com/cilium/ebpf/rlimit"
 )
 
-// IsSupported checks if the current system supports eBPF programs
-// Verifies OS compatibility, memory limits, and required eBPF features
-func IsSupported() bool {
-	// eBPF is only available on Linux
-	if runtime.GOOS != "linux" {
-		return false
-	}
-
-	// Remove memory limit for eBPF - required for loading programs
-	if err := rlimit.RemoveMemlock(); err != nil {
-		return false
-	}
-
-	// Check if basic eBPF program types are supported
-	if err := features.HaveProgType(ebpf.SocketFilter); err != nil {
-		return false
-	}
-
-	// Check if basic eBPF map types are supported
-	if err := features.HaveMapType(ebpf.Array); err != nil {
-		return false
-	}
-
-	return true
+// SimpleManagerConfig 简化的管理器配置
+type SimpleManagerConfig struct {
+	EnabledHooks        []HookPoint
+	XDPMode             XDPProgramType
+	StatsReportInterval time.Duration
+	EnableDetailedLog   bool
 }
 
-// ManagerConfig 管理器配置
-type ManagerConfig struct {
-	// XDP配置
-	XDPMode         XDPProgramType
-	EnableXDPEvents bool
-
-	// TC配置
-	EnableTCEvents       bool
-	EnableDetailedEvents bool
-
-	// Ring Buffer配置
-	BatchSize    int
-	BatchTimeout time.Duration
-
-	// 监控配置
-	StatsReportInterval  time.Duration
-	EnableSecurityAlerts bool
-}
-
-// DefaultManagerConfig 默认配置
-func DefaultManagerConfig() *ManagerConfig {
-	return &ManagerConfig{
-		XDPMode:              XDPAdvancedFilter,
-		EnableXDPEvents:      false,
-		EnableTCEvents:       true,
-		EnableDetailedEvents: false,
-		BatchSize:            100,
-		BatchTimeout:         100 * time.Millisecond,
-		StatsReportInterval:  60 * time.Second,
-		EnableSecurityAlerts: true,
+// DefaultSimpleManagerConfig 默认简化配置
+func DefaultSimpleManagerConfig() *SimpleManagerConfig {
+	return &SimpleManagerConfig{
+		EnabledHooks:        []HookPoint{HookXDP, HookTCIngress, HookTCEgress},
+		XDPMode:             XDPAdvancedFilter,
+		StatsReportInterval: 60 * time.Second,
+		EnableDetailedLog:   false,
 	}
 }
 
-// Manager coordinates eBPF program lifecycle and provides high-level API
-// Manages loading, attachment, and cleanup of network monitoring programs
-type Manager struct {
-	networkLoader *NetworkLoader // Handles network-specific eBPF operations
-	config        *ManagerConfig // Manager configuration
-
-	// Event handlers
-	securityHandler  *SecurityEventHandler     // Security event processing
-	lbHandler        *LoadBalancerEventHandler // Load balancer event processing
-	statsHandler     *StatisticsEventHandler   // Statistics event processing
-	compositeHandler *CompositeEventHandler    // Composite handler
-
-	// Runtime control
+// SimpleEBPFManager 简化的eBPF管理器
+type SimpleEBPFManager struct {
+	config            *SimpleManagerConfig
+	networkLoader     *NetworkLoader
+	handlers          map[string]EventHandler
 	ctx               context.Context
 	cancel            context.CancelFunc
+	mutex             sync.RWMutex
 	monitoringActive  bool
 	attachedInterface string
+	statsTimer        *time.Timer
 }
 
-// NewManager creates a new eBPF manager instance
-// Initializes all necessary components for network monitoring
-func NewManager() *Manager {
-	return NewManagerWithConfig(DefaultManagerConfig())
+// NewSimpleEBPFManager 创建简化的eBPF管理器
+func NewSimpleEBPFManager() *SimpleEBPFManager {
+	return NewSimpleEBPFManagerWithConfig(DefaultSimpleManagerConfig())
 }
 
-// NewManagerWithConfig creates a new eBPF manager with custom configuration
-func NewManagerWithConfig(config *ManagerConfig) *Manager {
+// NewSimpleEBPFManagerWithConfig 使用自定义配置创建eBPF管理器
+func NewSimpleEBPFManagerWithConfig(config *SimpleManagerConfig) *SimpleEBPFManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create event handlers
-	securityHandler := NewSecurityEventHandler()
-	lbHandler := NewLoadBalancerEventHandler()
-	statsHandler := NewStatisticsEventHandler()
-
-	// Create composite handler
-	compositeHandler := NewCompositeEventHandler()
-	compositeHandler.AddHandler(securityHandler)
-	compositeHandler.AddHandler(lbHandler)
-	compositeHandler.AddHandler(statsHandler)
-
-	// Create network loader
-	networkLoader := NewNetworkLoader()
-	networkLoader.SetXDPProgramType(config.XDPMode)
-
-	// Configure Ring Buffer
-	rbConfig := &RingBufferConfig{
-		EnableXDPEvents:      config.EnableXDPEvents,
-		EnableTCEvents:       config.EnableTCEvents,
-		EnableDetailedEvents: config.EnableDetailedEvents,
-	}
-	networkLoader.SetRingBufferConfig(rbConfig)
-
-	manager := &Manager{
-		networkLoader:    networkLoader,
-		config:           config,
-		securityHandler:  securityHandler,
-		lbHandler:        lbHandler,
-		statsHandler:     statsHandler,
-		compositeHandler: compositeHandler,
-		ctx:              ctx,
-		cancel:           cancel,
-		monitoringActive: false,
+	manager := &SimpleEBPFManager{
+		config:   config,
+		handlers: make(map[string]EventHandler),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
-	// Setup security alerts if enabled
-	if config.EnableSecurityAlerts {
-		securityHandler.SetAlertCallback(manager.handleSecurityAlert)
-	}
+	// 创建网络加载器
+	manager.networkLoader = NewNetworkLoader()
+	manager.networkLoader.SetXDPProgramType(config.XDPMode)
+	manager.networkLoader.SetRingBufferConfig(&RingBufferConfig{
+		EnableXDPEvents: true,
+		EnableTCEvents:  true,
+	})
+
+	// 初始化处理器
+	manager.initHandlers()
 
 	return manager
 }
 
-// LoadNetworkMonitor loads network monitoring eBPF programs into kernel
-// Must be called before attaching programs to interfaces
-func (m *Manager) LoadNetworkMonitor() error {
+// initHandlers 初始化事件处理器
+func (m *SimpleEBPFManager) initHandlers() {
+	// 创建XDP处理器
+	for _, hook := range m.config.EnabledHooks {
+		if hook == HookXDP {
+			handler := NewXDPHandler(&XDPHandlerConfig{
+				EnableDetailedLogging: m.config.EnableDetailedLog,
+				LogInterval:           30 * time.Second,
+			})
+			m.handlers[handler.GetName()] = handler
+			log.Printf("✅ Initialized XDP handler")
+			break
+		}
+	}
+
+	// 创建TC处理器
+	hasTC := false
+	for _, hook := range m.config.EnabledHooks {
+		if hook == HookTCIngress || hook == HookTCEgress {
+			hasTC = true
+			break
+		}
+	}
+	if hasTC {
+		handler := NewTCHandler(&TCHandlerConfig{
+			EnableDetailedLogging: m.config.EnableDetailedLog,
+			LogInterval:           30 * time.Second,
+			TrackDirections:       true,
+		})
+		m.handlers[handler.GetName()] = handler
+		log.Printf("✅ Initialized TC handler")
+	}
+
+	// 创建安全处理器
+	handler := NewSecurityHandler(&SecurityHandlerConfig{
+		AlertThreshold:  10,
+		CleanupInterval: 5 * time.Minute,
+		EnableAlerting:  true,
+	})
+	m.handlers[handler.GetName()] = handler
+	log.Printf("✅ Initialized Security handler")
+}
+
+// LoadNetworkMonitor 加载网络监控eBPF程序到内核
+func (m *SimpleEBPFManager) LoadNetworkMonitor() error {
 	log.Println("🚀 Loading eBPF network monitoring programs...")
 
 	if err := m.networkLoader.LoadPrograms(); err != nil {
 		return fmt.Errorf("loading eBPF programs: %w", err)
 	}
 
-	// Initialize Ring Buffer reader
+	// 初始化Ring Buffer读取器
 	if err := m.networkLoader.InitializeRingBufferReader(m.ctx); err != nil {
 		return fmt.Errorf("initializing ring buffer: %w", err)
 	}
 
-	// Add event handlers
-	m.networkLoader.AddEventHandler(m.compositeHandler)
+	// 添加事件处理器到网络加载器
+	for _, handler := range m.handlers {
+		m.networkLoader.AddEventHandler(handler)
+	}
 
 	log.Println("✅ eBPF programs loaded successfully")
 	return nil
 }
 
-// AttachNetworkMonitor attaches loaded programs to specified network interface
-// Interface must exist and be accessible for attachment to succeed
-func (m *Manager) AttachNetworkMonitor(interfaceName string) error {
+// AttachNetworkMonitor 将加载的程序附加到指定网络接口
+func (m *SimpleEBPFManager) AttachNetworkMonitor(interfaceName string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	if m.monitoringActive {
 		return fmt.Errorf("monitoring is already active on interface %s", m.attachedInterface)
 	}
 
-	log.Printf("📡 Attaching network monitor to interface %s with %s mode...",
-		interfaceName, m.getXDPModeString())
+	log.Printf("📡 Attaching network monitor to interface %s...", interfaceName)
 
 	if err := m.networkLoader.AttachNetworkPrograms(interfaceName); err != nil {
 		return fmt.Errorf("attaching to interface %s: %w", interfaceName, err)
 	}
 
-	// Start Ring Buffer processing
+	// 启动Ring Buffer处理
 	if err := m.networkLoader.StartRingBufferProcessing(); err != nil {
 		return fmt.Errorf("starting ring buffer processing: %w", err)
 	}
 
-	// Start monitoring routines
-	go m.monitoringLoop()
-	go m.periodicStatsReport()
-
 	m.attachedInterface = interfaceName
 	m.monitoringActive = true
 
-	log.Printf("✅ Network monitoring started on %s", interfaceName)
+	// 启动统计报告定时器
+	m.startStatsReporting()
+
+	log.Printf("✅ Network monitor attached to interface %s and started", interfaceName)
 	return nil
 }
 
-// DetachNetworkMonitor detaches programs from the currently attached interface
-func (m *Manager) DetachNetworkMonitor() error {
+// DetachNetworkMonitor 从网络接口分离程序
+func (m *SimpleEBPFManager) DetachNetworkMonitor() error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	if !m.monitoringActive {
-		return fmt.Errorf("monitoring is not active")
-	}
-
-	log.Printf("🛑 Detaching network monitor from interface %s...", m.attachedInterface)
-
-	m.cancel()
-	m.monitoringActive = false
-	m.attachedInterface = ""
-
-	// Create new context for future use
-	m.ctx, m.cancel = context.WithCancel(context.Background())
-
-	log.Println("✅ Network monitoring detached")
-	return nil
-}
-
-// SwitchXDPMode switches the XDP program mode
-func (m *Manager) SwitchXDPMode(mode XDPProgramType) error {
-	if m.config.XDPMode == mode {
 		return nil
 	}
 
-	log.Printf("🔄 Switching XDP mode to %s", m.getXDPModeString(mode))
+	log.Printf("📡 Detaching network monitor from interface %s...", m.attachedInterface)
 
-	// Update configuration
-	m.config.XDPMode = mode
-	m.networkLoader.SetXDPProgramType(mode)
-
-	// If monitoring is active, reattach with new mode
-	if m.monitoringActive {
-		interfaceName := m.attachedInterface
-		if err := m.DetachNetworkMonitor(); err != nil {
-			return fmt.Errorf("detaching for mode switch: %w", err)
-		}
-		if err := m.AttachNetworkMonitor(interfaceName); err != nil {
-			return fmt.Errorf("reattaching with new mode: %w", err)
-		}
+	// 停止统计报告定时器
+	if m.statsTimer != nil {
+		m.statsTimer.Stop()
+		m.statsTimer = nil
 	}
 
-	log.Printf("✅ Successfully switched to %s mode", m.getXDPModeString(mode))
+	// 关闭网络加载器
+	if err := m.networkLoader.Close(); err != nil {
+		log.Printf("⚠️  Error closing network loader: %v", err)
+	}
+
+	m.monitoringActive = false
+	m.attachedInterface = ""
+
+	log.Println("✅ Network monitor detached")
 	return nil
 }
 
-// Statistics and Security Management
-func (m *Manager) GetNetworkStats() (map[string]uint64, error) {
-	return m.networkLoader.GetStats()
+// Close 关闭管理器并清理资源
+func (m *SimpleEBPFManager) Close() error {
+	m.DetachNetworkMonitor()
+
+	if m.cancel != nil {
+		m.cancel()
+	}
+
+	log.Println("✅ Simple eBPF Manager closed")
+	return nil
 }
 
-func (m *Manager) GetGlobalStats() (*GlobalStats, error) {
-	return m.networkLoader.ReadGlobalStats()
+// GetHandlerQueryInterface 根据处理器名称获取查询接口
+func (m *SimpleEBPFManager) GetHandlerQueryInterface(handlerName string) (QueryInterface, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	handler, exists := m.handlers[handlerName]
+	if !exists {
+		return nil, fmt.Errorf("handler '%s' not found", handlerName)
+	}
+
+	return handler.GetQueryInterface(), nil
 }
 
-func (m *Manager) GetSecurityStats() (*SecurityStats, error) {
-	return m.networkLoader.ReadSecurityStats()
+// GetXDPStats 获取XDP统计信息
+func (m *SimpleEBPFManager) GetXDPStats() (*TrafficStats, error) {
+	queryInterface, err := m.GetHandlerQueryInterface("XDP Handler")
+	if err != nil {
+		return nil, err
+	}
+
+	return queryInterface.GetTotalStats(), nil
 }
 
-func (m *Manager) GetLoadBalancerStats() (*LoadBalancerStats, error) {
-	return m.networkLoader.ReadLoadBalancerStats()
+// GetTCStats 获取TC统计信息
+func (m *SimpleEBPFManager) GetTCStats() (*TrafficStats, error) {
+	queryInterface, err := m.GetHandlerQueryInterface("TC Handler")
+	if err != nil {
+		return nil, err
+	}
+
+	return queryInterface.GetTotalStats(), nil
 }
 
-func (m *Manager) AddIPToBlacklist(ip string) error {
-	return m.networkLoader.AddToBlacklist(ip)
+// GetTCIngressStats 获取TC Ingress统计信息
+func (m *SimpleEBPFManager) GetTCIngressStats() (*TrafficStats, error) {
+	queryInterface, err := m.GetHandlerQueryInterface("TC Handler")
+	if err != nil {
+		return nil, err
+	}
+
+	return queryInterface.GetHookStats(HookTCIngress), nil
 }
 
-func (m *Manager) RemoveIPFromBlacklist(ip string) error {
-	return m.networkLoader.RemoveFromBlacklist(ip)
+// GetTCEgressStats 获取TC Egress统计信息
+func (m *SimpleEBPFManager) GetTCEgressStats() (*TrafficStats, error) {
+	queryInterface, err := m.GetHandlerQueryInterface("TC Handler")
+	if err != nil {
+		return nil, err
+	}
+
+	return queryInterface.GetHookStats(HookTCEgress), nil
 }
 
-func (m *Manager) GetBlacklistedIPs() ([]string, error) {
-	return m.networkLoader.GetBlacklistedIPs()
+// GetSecurityStats 获取安全统计信息
+func (m *SimpleEBPFManager) GetSecurityStats() (*TrafficStats, error) {
+	queryInterface, err := m.GetHandlerQueryInterface("Security Handler")
+	if err != nil {
+		return nil, err
+	}
+
+	return queryInterface.GetTotalStats(), nil
 }
 
-// Configuration and State
-func (m *Manager) UpdateConfig(config *ManagerConfig) {
-	m.config = config
-	m.networkLoader.SetXDPProgramType(config.XDPMode)
+// ResetAllStats 重置所有处理器的统计信息
+func (m *SimpleEBPFManager) ResetAllStats() error {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	for _, handler := range m.handlers {
+		queryInterface := handler.GetQueryInterface()
+		queryInterface.ResetStats()
+	}
+
+	log.Println("📊 All handler statistics have been reset")
+	return nil
 }
 
-func (m *Manager) GetConfig() *ManagerConfig {
-	return m.config
-}
+// IsMonitoringActive 检查监控是否活跃
+func (m *SimpleEBPFManager) IsMonitoringActive() bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 
-func (m *Manager) IsMonitoringActive() bool {
 	return m.monitoringActive
 }
 
-func (m *Manager) GetAttachedInterface() string {
+// GetAttachedInterface 获取当前附加的接口
+func (m *SimpleEBPFManager) GetAttachedInterface() string {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
 	return m.attachedInterface
 }
 
-func (m *Manager) GetCurrentXDPMode() XDPProgramType {
-	return m.config.XDPMode
-}
-
-// Demo Methods
-func (m *Manager) DemoBasicMonitoring(interfaceName string, duration time.Duration) error {
-	log.Println("📊 Starting Basic Network Monitoring Demo")
-
-	if err := m.SwitchXDPMode(XDPBasicMonitor); err != nil {
-		return err
+// startStatsReporting 启动统计报告
+func (m *SimpleEBPFManager) startStatsReporting() {
+	if m.config.StatsReportInterval <= 0 {
+		return
 	}
 
-	if !m.monitoringActive {
-		if err := m.AttachNetworkMonitor(interfaceName); err != nil {
-			return err
+	m.statsTimer = time.AfterFunc(m.config.StatsReportInterval, func() {
+		m.reportStats()
+		// 重新设置定时器
+		if m.monitoringActive {
+			m.startStatsReporting()
 		}
-	}
-
-	time.Sleep(duration)
-	m.printStats()
-	return nil
+	})
 }
 
-func (m *Manager) DemoSecurityFiltering(interfaceName string, duration time.Duration) error {
-	log.Println("🛡️ Starting Security Filtering Demo")
+// reportStats 报告统计信息
+func (m *SimpleEBPFManager) reportStats() {
+	log.Printf("📊 === Simple eBPF Manager Statistics Report ===")
 
-	if err := m.SwitchXDPMode(XDPAdvancedFilter); err != nil {
-		return err
-	}
+	// 报告各处理器统计
+	for name, handler := range m.handlers {
+		queryInterface := handler.GetQueryInterface()
+		stats := queryInterface.GetTotalStats()
 
-	if !m.monitoringActive {
-		if err := m.AttachNetworkMonitor(interfaceName); err != nil {
-			return err
-		}
-	}
+		log.Printf("Handler [%s]:", name)
+		log.Printf("  Packets: %d", stats.PacketCount)
+		log.Printf("  Bytes: %s", formatBytes(stats.ByteCount))
 
-	time.Sleep(duration)
-	m.printStats()
-	return nil
-}
-
-func (m *Manager) DemoLoadBalancing(interfaceName string, duration time.Duration) error {
-	log.Println("⚖️ Starting Load Balancing Demo")
-
-	if err := m.SwitchXDPMode(XDPLoadBalancer); err != nil {
-		return err
-	}
-
-	if !m.monitoringActive {
-		if err := m.AttachNetworkMonitor(interfaceName); err != nil {
-			return err
-		}
-	}
-
-	time.Sleep(duration)
-	m.printStats()
-	return nil
-}
-
-// Utility methods
-func (m *Manager) GetNetworkLoader() *NetworkLoader {
-	return m.networkLoader
-}
-
-func (m *Manager) Close() error {
-	if m.monitoringActive {
-		m.DetachNetworkMonitor()
-	}
-	if m.networkLoader != nil {
-		return m.networkLoader.Close()
-	}
-	return nil
-}
-
-// Internal monitoring loops
-func (m *Manager) monitoringLoop() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-ticker.C:
-			if m.config.XDPMode == XDPAdvancedFilter {
-				m.networkLoader.ClearExpiredBlacklist()
+		if len(stats.ProtocolStats) > 0 && stats.PacketCount > 0 {
+			log.Printf("  Top Protocols:")
+			for proto, count := range stats.ProtocolStats {
+				if count > 0 {
+					percentage := float64(count) / float64(stats.PacketCount) * 100
+					log.Printf("    %s: %d (%.1f%%)", getProtocolName(proto), count, percentage)
+				}
 			}
 		}
 	}
+
+	log.Printf("===========================================")
 }
 
-func (m *Manager) printStats() {
-	if stats, err := m.GetGlobalStats(); err == nil {
-		log.Printf("📈 Global Stats: %s", stats.String())
+// SetSecurityAlertCallback 设置安全告警回调
+func (m *SimpleEBPFManager) SetSecurityAlertCallback(callback func(event *NetworkEvent)) error {
+	handler, exists := m.handlers["Security Handler"]
+	if !exists {
+		return fmt.Errorf("security handler not found")
 	}
-	
-	if m.config.XDPMode == XDPAdvancedFilter {
-		if secStats, err := m.GetSecurityStats(); err == nil {
-			log.Printf("🛡️ Security: DDoS Blocked=%d, Events=%d", 
-				secStats.DDosBlocked, secStats.SecurityEvents)
-		}
-	}
-	
-	if m.config.XDPMode == XDPLoadBalancer {
-		if lbStats, err := m.GetLoadBalancerStats(); err == nil {
-			log.Printf("⚖️ Load Balancer: %d decisions", lbStats.LBDecisions)
-		}
-	}
-}
 
-func (m *Manager) getXDPModeString(mode XDPProgramType) string {
-	switch mode {
-	case XDPBasicMonitor:
-		return "Basic Monitor"
-	case XDPAdvancedFilter:
-		return "Advanced Filter"
-	case XDPLoadBalancer:
-		return "Load Balancer"
-	default:
-		return "Unknown"
+	if securityHandler, ok := handler.(*SecurityHandler); ok {
+		securityHandler.SetAlertCallback(callback)
+		return nil
 	}
+
+	return fmt.Errorf("security handler type assertion failed")
 }

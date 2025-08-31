@@ -12,10 +12,23 @@
 #include <linux/udp.h>
 #include <linux/icmp.h>
 #include <linux/in.h>
-#include <linux/netfilter.h>
-#include <linux/netfilter_ipv4.h>
+#include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+// Netfilter 常量定义（模拟）
+#define NF_INET_PRE_ROUTING     0
+#define NF_INET_LOCAL_IN        1
+#define NF_INET_FORWARD         2
+#define NF_INET_LOCAL_OUT       3
+#define NF_INET_POST_ROUTING    4
+
+#define NF_DROP                 0
+#define NF_ACCEPT               1
+#define NF_STOLEN               2
+#define NF_QUEUE                3
+#define NF_REPEAT               4
+#define NF_STOP                 5
 
 // Netfilter 事件类型
 #define NF_EVENT_PREROUTING     0
@@ -59,7 +72,7 @@ struct nf_packet_info {
     __u8  verdict;          // 决策结果
     __u8  rule_id;          // 规则ID
     __u16 frag_off;         // 分片偏移
-} __attribute__((packed));
+};
 
 // Netfilter 事件结构体 - Ring Buffer 传输
 struct netfilter_event {
@@ -80,7 +93,7 @@ struct netfilter_event {
     __u32 nat_dst_ip;       // NAT 前目标IP
     __u16 nat_src_port;     // NAT 前源端口
     __u16 nat_dst_port;     // NAT 前目标端口
-} __attribute__((packed));
+};
 
 // 防火墙规则结构体
 struct firewall_rule {
@@ -99,7 +112,7 @@ struct firewall_rule {
     __u8  enabled;          // 是否启用
     __u64 hit_count;        // 命中次数
     __u64 byte_count;       // 字节计数
-} __attribute__((packed));
+};
 
 // 连接跟踪条目
 struct connection_track {
@@ -115,7 +128,7 @@ struct connection_track {
     __u64 first_seen;       // 首次看到时间
     __u64 last_seen;        // 最后看到时间
     __u32 timeout;          // 超时时间
-} __attribute__((packed));
+};
 
 // eBPF Maps
 
@@ -229,7 +242,7 @@ static inline __u64 calculate_flow_hash(__u32 src_ip, __u32 dst_ip,
 }
 
 // Helper 函数：解析包头信息
-static inline int parse_packet_nf(struct sk_buff *skb, struct nf_packet_info *info) {
+static inline int parse_packet_nf(struct __sk_buff *skb, struct nf_packet_info *info) {
     struct iphdr *ip;
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
@@ -371,9 +384,8 @@ static inline int update_connection_track(struct nf_packet_info *info) {
 }
 
 // Netfilter PREROUTING Hook
-SEC("netfilter/prerouting")
-int netfilter_prerouting(struct bpf_nf_ctx *ctx) {
-    struct sk_buff *skb = ctx->skb;
+SEC("tc")
+int netfilter_prerouting(struct __sk_buff *skb) {
     struct nf_packet_info packet_info = {0};
     struct netfilter_event event = {0};
     
@@ -423,172 +435,10 @@ int netfilter_prerouting(struct bpf_nf_ctx *ctx) {
     if (verdict == NF_VERDICT_DROP) {
         update_netfilter_stats(NF_STAT_DROPPED_PACKETS, 1);
         update_netfilter_stats(NF_STAT_DROPPED_BYTES, packet_info.packet_len);
-        return NF_DROP;
+        return TC_ACT_SHOT;
     }
     
-    return NF_ACCEPT;
-}
-
-// Netfilter LOCAL_IN Hook
-SEC("netfilter/local_in")
-int netfilter_local_in(struct bpf_nf_ctx *ctx) {
-    struct sk_buff *skb = ctx->skb;
-    struct nf_packet_info packet_info = {0};
-    struct netfilter_event event = {0};
-    
-    if (parse_packet_nf(skb, &packet_info) < 0) {
-        return NF_ACCEPT;
-    }
-    
-    packet_info.hook = NF_INET_LOCAL_IN;
-    
-    // 构造事件
-    event.timestamp = bpf_ktime_get_ns();
-    event.event_type = NF_EVENT_LOCAL_IN;
-    event.src_ip = packet_info.src_ip;
-    event.dst_ip = packet_info.dst_ip;
-    event.src_port = packet_info.src_port;
-    event.dst_port = packet_info.dst_port;
-    event.protocol = packet_info.protocol;
-    event.verdict = NF_VERDICT_ACCEPT;
-    event.hook_point = NF_INET_LOCAL_IN;
-    event.packet_len = packet_info.packet_len;
-    
-    send_netfilter_event(&event);
-    
-    // 更新统计
-    update_netfilter_stats(NF_STAT_LOCALIN_PACKETS, 1);
-    update_netfilter_stats(NF_STAT_LOCALIN_BYTES, packet_info.packet_len);
-    update_hook_stats(NF_INET_LOCAL_IN, 1);
-    
-    return NF_ACCEPT;
-}
-
-// Netfilter FORWARD Hook
-SEC("netfilter/forward")
-int netfilter_forward(struct bpf_nf_ctx *ctx) {
-    struct sk_buff *skb = ctx->skb;
-    struct nf_packet_info packet_info = {0};
-    struct netfilter_event event = {0};
-    
-    if (parse_packet_nf(skb, &packet_info) < 0) {
-        return NF_ACCEPT;
-    }
-    
-    packet_info.hook = NF_INET_FORWARD;
-    
-    // 检查转发规则
-    int rule_action = check_firewall_rules(&packet_info, 2); // 双向
-    __u8 verdict = (rule_action == NF_RULE_DENY) ? NF_VERDICT_DROP : NF_VERDICT_ACCEPT;
-    
-    // 构造事件
-    event.timestamp = bpf_ktime_get_ns();
-    event.event_type = NF_EVENT_FORWARD;
-    event.src_ip = packet_info.src_ip;
-    event.dst_ip = packet_info.dst_ip;
-    event.src_port = packet_info.src_port;
-    event.dst_port = packet_info.dst_port;
-    event.protocol = packet_info.protocol;
-    event.verdict = verdict;
-    event.hook_point = NF_INET_FORWARD;
-    event.rule_action = rule_action;
-    event.packet_len = packet_info.packet_len;
-    
-    send_netfilter_event(&event);
-    
-    // 更新统计
-    update_netfilter_stats(NF_STAT_FORWARD_PACKETS, 1);
-    update_netfilter_stats(NF_STAT_FORWARD_BYTES, packet_info.packet_len);
-    update_hook_stats(NF_INET_FORWARD, 1);
-    
-    if (verdict == NF_VERDICT_DROP) {
-        update_netfilter_stats(NF_STAT_DROPPED_PACKETS, 1);
-        update_netfilter_stats(NF_STAT_DROPPED_BYTES, packet_info.packet_len);
-        return NF_DROP;
-    }
-    
-    return NF_ACCEPT;
-}
-
-// Netfilter LOCAL_OUT Hook
-SEC("netfilter/local_out")
-int netfilter_local_out(struct bpf_nf_ctx *ctx) {
-    struct sk_buff *skb = ctx->skb;
-    struct nf_packet_info packet_info = {0};
-    struct netfilter_event event = {0};
-    
-    if (parse_packet_nf(skb, &packet_info) < 0) {
-        return NF_ACCEPT;
-    }
-    
-    packet_info.hook = NF_INET_LOCAL_OUT;
-    
-    // 检查出站规则
-    int rule_action = check_firewall_rules(&packet_info, 1); // 出方向
-    __u8 verdict = (rule_action == NF_RULE_DENY) ? NF_VERDICT_DROP : NF_VERDICT_ACCEPT;
-    
-    // 构造事件
-    event.timestamp = bpf_ktime_get_ns();
-    event.event_type = NF_EVENT_LOCAL_OUT;
-    event.src_ip = packet_info.src_ip;
-    event.dst_ip = packet_info.dst_ip;
-    event.src_port = packet_info.src_port;
-    event.dst_port = packet_info.dst_port;
-    event.protocol = packet_info.protocol;
-    event.verdict = verdict;
-    event.hook_point = NF_INET_LOCAL_OUT;
-    event.rule_action = rule_action;
-    event.packet_len = packet_info.packet_len;
-    
-    send_netfilter_event(&event);
-    
-    // 更新统计
-    update_netfilter_stats(NF_STAT_LOCALOUT_PACKETS, 1);
-    update_netfilter_stats(NF_STAT_LOCALOUT_BYTES, packet_info.packet_len);
-    update_hook_stats(NF_INET_LOCAL_OUT, 1);
-    
-    if (verdict == NF_VERDICT_DROP) {
-        update_netfilter_stats(NF_STAT_DROPPED_PACKETS, 1);
-        update_netfilter_stats(NF_STAT_DROPPED_BYTES, packet_info.packet_len);
-        return NF_DROP;
-    }
-    
-    return NF_ACCEPT;
-}
-
-// Netfilter POSTROUTING Hook
-SEC("netfilter/postrouting")
-int netfilter_postrouting(struct bpf_nf_ctx *ctx) {
-    struct sk_buff *skb = ctx->skb;
-    struct nf_packet_info packet_info = {0};
-    struct netfilter_event event = {0};
-    
-    if (parse_packet_nf(skb, &packet_info) < 0) {
-        return NF_ACCEPT;
-    }
-    
-    packet_info.hook = NF_INET_POST_ROUTING;
-    
-    // 构造事件
-    event.timestamp = bpf_ktime_get_ns();
-    event.event_type = NF_EVENT_POSTROUTING;
-    event.src_ip = packet_info.src_ip;
-    event.dst_ip = packet_info.dst_ip;
-    event.src_port = packet_info.src_port;
-    event.dst_port = packet_info.dst_port;
-    event.protocol = packet_info.protocol;
-    event.verdict = NF_VERDICT_ACCEPT;
-    event.hook_point = NF_INET_POST_ROUTING;
-    event.packet_len = packet_info.packet_len;
-    
-    send_netfilter_event(&event);
-    
-    // 更新统计
-    update_netfilter_stats(NF_STAT_POSTROUTING_PACKETS, 1);
-    update_netfilter_stats(NF_STAT_POSTROUTING_BYTES, packet_info.packet_len);
-    update_hook_stats(NF_INET_POST_ROUTING, 1);
-    
-    return NF_ACCEPT;
+    return TC_ACT_OK;
 }
 
 char _license[] SEC("license") = "GPL";
