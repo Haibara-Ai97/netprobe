@@ -14,6 +14,8 @@ type SimpleManagerConfig struct {
 	XDPMode             XDPProgramType
 	StatsReportInterval time.Duration
 	EnableDetailedLog   bool
+	EnableVXLAN         bool   // 启用VXLAN监控
+	VXLANInterface      string // VXLAN接口名称
 }
 
 // DefaultSimpleManagerConfig 默认简化配置
@@ -23,6 +25,8 @@ func DefaultSimpleManagerConfig() *SimpleManagerConfig {
 		XDPMode:             XDPAdvancedFilter,
 		StatsReportInterval: 60 * time.Second,
 		EnableDetailedLog:   false,
+		EnableVXLAN:         false,
+		VXLANInterface:      "flannel.1",
 	}
 }
 
@@ -30,11 +34,13 @@ func DefaultSimpleManagerConfig() *SimpleManagerConfig {
 type SimpleEBPFManager struct {
 	config            *SimpleManagerConfig
 	networkLoader     *NetworkLoader
+	vxlanLoader       *VxlanLoader
 	handlers          map[string]EventHandler
 	ctx               context.Context
 	cancel            context.CancelFunc
 	mutex             sync.RWMutex
 	monitoringActive  bool
+	vxlanActive       bool
 	attachedInterface string
 	statsTimer        *time.Timer
 }
@@ -196,6 +202,7 @@ func (m *SimpleEBPFManager) DetachNetworkMonitor() error {
 // Close 关闭管理器并清理资源
 func (m *SimpleEBPFManager) Close() error {
 	m.DetachNetworkMonitor()
+	m.DetachVXLANMonitor()
 
 	if m.cancel != nil {
 		m.cancel()
@@ -338,6 +345,118 @@ func (m *SimpleEBPFManager) reportStats() {
 	}
 
 	log.Printf("===========================================")
+}
+
+// VXLAN 监控相关方法
+
+// LoadVXLANMonitor 加载VXLAN监控程序
+func (m *SimpleEBPFManager) LoadVXLANMonitor() error {
+	if !m.config.EnableVXLAN {
+		return fmt.Errorf("VXLAN monitoring is not enabled in configuration")
+	}
+
+	log.Printf("🚀 Loading VXLAN monitoring for interface %s...", m.config.VXLANInterface)
+
+	vxlanLoader, err := NewVxlanLoader(m.config.VXLANInterface)
+	if err != nil {
+		return fmt.Errorf("failed to create VXLAN loader: %v", err)
+	}
+
+	// 设置默认事件处理器
+	vxlanLoader.SetEventHandler(&DefaultVxlanEventHandler{})
+	vxlanLoader.SetStatsInterval(m.config.StatsReportInterval)
+
+	if err := vxlanLoader.Load(); err != nil {
+		return fmt.Errorf("failed to load VXLAN eBPF program: %v", err)
+	}
+
+	m.vxlanLoader = vxlanLoader
+	m.vxlanActive = true
+
+	log.Printf("✅ VXLAN monitor loaded successfully on interface %s", m.config.VXLANInterface)
+	return nil
+}
+
+// DetachVXLANMonitor 停止VXLAN监控
+func (m *SimpleEBPFManager) DetachVXLANMonitor() error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if !m.vxlanActive || m.vxlanLoader == nil {
+		return nil
+	}
+
+	log.Printf("📡 Stopping VXLAN monitor on interface %s...", m.config.VXLANInterface)
+
+	if err := m.vxlanLoader.Close(); err != nil {
+		log.Printf("⚠️  Error closing VXLAN loader: %v", err)
+	}
+
+	m.vxlanLoader = nil
+	m.vxlanActive = false
+
+	log.Println("✅ VXLAN monitor stopped")
+	return nil
+}
+
+// SetVXLANEventHandler 设置VXLAN事件处理器
+func (m *SimpleEBPFManager) SetVXLANEventHandler(handler VxlanEventHandler) error {
+	if m.vxlanLoader == nil {
+		return fmt.Errorf("VXLAN loader is not initialized")
+	}
+
+	m.vxlanLoader.SetEventHandler(handler)
+	return nil
+}
+
+// GetVXLANFlowStats 获取VXLAN流量统计
+func (m *SimpleEBPFManager) GetVXLANFlowStats() (map[VxlanFlowKey]VxlanFlowStats, error) {
+	if m.vxlanLoader == nil {
+		return nil, fmt.Errorf("VXLAN loader is not initialized")
+	}
+
+	return m.vxlanLoader.GetFlowStats()
+}
+
+// GetVXLANInterfaceStats 获取VXLAN接口统计
+func (m *SimpleEBPFManager) GetVXLANInterfaceStats() (map[uint32]BasicStats, error) {
+	if m.vxlanLoader == nil {
+		return nil, fmt.Errorf("VXLAN loader is not initialized")
+	}
+
+	return m.vxlanLoader.GetInterfaceStats()
+}
+
+// GetVXLANNetworkStats 获取VXLAN网络统计
+func (m *SimpleEBPFManager) GetVXLANNetworkStats() (map[uint32]BasicStats, error) {
+	if m.vxlanLoader == nil {
+		return nil, fmt.Errorf("VXLAN loader is not initialized")
+	}
+
+	return m.vxlanLoader.GetNetworkStats()
+}
+
+// AddPodInfo 添加Pod信息到VXLAN监控
+func (m *SimpleEBPFManager) AddPodInfo(podIP, nodeIP uint32, vni uint32, podName, namespace string) error {
+	if m.vxlanLoader == nil {
+		return fmt.Errorf("VXLAN loader is not initialized")
+	}
+
+	return m.vxlanLoader.AddPodInfo(podIP, nodeIP, vni, podName, namespace)
+}
+
+// RemovePodInfo 从VXLAN监控中移除Pod信息
+func (m *SimpleEBPFManager) RemovePodInfo(podIP uint32) error {
+	if m.vxlanLoader == nil {
+		return fmt.Errorf("VXLAN loader is not initialized")
+	}
+
+	return m.vxlanLoader.RemovePodInfo(podIP)
+}
+
+// IsVXLANActive 检查VXLAN监控是否活跃
+func (m *SimpleEBPFManager) IsVXLANActive() bool {
+	return m.vxlanActive
 }
 
 // SetSecurityAlertCallback 设置安全告警回调
