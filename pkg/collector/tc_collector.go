@@ -82,7 +82,7 @@ type previousStats struct {
 // TCCollector implements Traffic Control layer data collection
 // Reads statistics from eBPF maps and calculates network rates
 type TCCollector struct {
-	manager         *ebpf.Manager                             // eBPF program manager
+	manager         *ebpf.SimpleEBPFManager                             // eBPF program manager
 	interfaces      map[uint32]string                         // Interface index to name mapping
 	previousStats   map[string]map[TCDirection]*previousStats // Historical data for rate calculation
 	mutex           sync.RWMutex                              // Thread-safe access protection
@@ -91,7 +91,7 @@ type TCCollector struct {
 
 // NewTCCollector creates a new Traffic Control layer collector
 // Initializes data structures for interface monitoring and rate calculation
-func NewTCCollector(manager *ebpf.Manager) *TCCollector {
+func NewTCCollector(manager *ebpf.SimpleEBPFManager) *TCCollector {
 	return &TCCollector{
 		manager:         manager,
 		interfaces:      make(map[uint32]string),

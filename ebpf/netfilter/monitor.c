@@ -1,4 +1,4 @@
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I../include" --target=amd64 NetfilterMonitor monitor.c
+// +build ignore
 
 // NetProbe eBPF Netfilter Monitor  
 // Netfilter 层网络包过滤和防火墙监控

@@ -41,7 +41,7 @@ type Manager struct {
 }
 
 // NewManager 创建新的收集器管理器
-func NewManager(ebpfManager *ebpf.Manager) *Manager {
+func NewManager(ebpfManager *ebpf.SimpleEBPFManager) *Manager {
 	return &Manager{
 		tcCollector: NewTCCollector(ebpfManager),
 	}

@@ -1,4 +1,4 @@
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I../include" --target=amd64 NetworkMonitor monitor.c
+// +build ignore
 
 // NetProbe eBPF Network Monitor with Ring Buffer
 // High-performance network traffic monitoring using zero-copy Ring Buffer technology

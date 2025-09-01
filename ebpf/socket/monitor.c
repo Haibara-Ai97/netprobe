@@ -1,4 +1,4 @@
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -I../include" --target=amd64 SocketMonitor monitor.c
+// +build ignore
 
 // NetProbe eBPF Socket Monitor
 // Socket 层网络连接监控，提供连接建立、数据传输、连接状态跟踪

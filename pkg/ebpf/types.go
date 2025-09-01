@@ -74,6 +74,62 @@ type NetworkEvent struct {
 	// 总计: 36 bytes (已对齐)
 }
 
+// SocketEvent Socket层事件结构体（与 eBPF 程序中的结构体对应）
+type SocketEvent struct {
+	Timestamp  uint64    // 8 bytes - 事件时间戳（纳秒）
+	EventType  uint32    // 4 bytes - 事件类型: 0=connect, 1=accept, 2=close, 3=send, 4=recv
+	PID        uint32    // 4 bytes - 进程ID
+	TID        uint32    // 4 bytes - 线程ID
+	SrcIP      uint32    // 4 bytes - 源IP
+	DstIP      uint32    // 4 bytes - 目标IP
+	SrcPort    uint16    // 2 bytes - 源端口
+	DstPort    uint16    // 2 bytes - 目标端口
+	Protocol   uint8     // 1 byte  - 协议
+	Family     uint8     // 1 byte  - 地址族
+	State      uint16    // 2 bytes - 连接状态
+	BytesSent  uint32    // 4 bytes - 发送字节数
+	BytesRecv  uint32    // 4 bytes - 接收字节数
+	DurationUs uint32    // 4 bytes - 连接持续时间（微秒）
+	Comm       [16]byte  // 16 bytes - 进程名
+	ErrorCode  uint32    // 4 bytes - 错误码
+	// 总计: 72 bytes
+}
+
+// String 格式化显示Socket事件
+func (se *SocketEvent) String() string {
+	srcIP := intToIP(se.SrcIP)
+	dstIP := intToIP(se.DstIP)
+	protocol := getProtocolName(se.Protocol)
+	timestamp := time.Unix(0, int64(se.Timestamp))
+	comm := string(se.Comm[:])
+	
+	eventTypes := []string{"CONNECT", "ACCEPT", "CLOSE", "SEND", "RECV"}
+	eventType := "UNKNOWN"
+	if se.EventType < uint32(len(eventTypes)) {
+		eventType = eventTypes[se.EventType]
+	}
+
+	return fmt.Sprintf("[SOCKET|%s] PID:%d %s %s:%d -> %s:%d (%s) at %s",
+		eventType, se.PID, protocol, srcIP, se.SrcPort, dstIP, se.DstPort,
+		comm, timestamp.Format("15:04:05.000"))
+}
+
+// SocketConnInfo Socket连接信息结构体（与 eBPF 程序中的结构体对应）
+type SocketConnInfo struct {
+	PID      uint32    // 4 bytes - 进程ID
+	TID      uint32    // 4 bytes - 线程ID
+	UID      uint32    // 4 bytes - 用户ID
+	SrcIP    uint32    // 4 bytes - 源IP地址
+	DstIP    uint32    // 4 bytes - 目标IP地址
+	SrcPort  uint16    // 2 bytes - 源端口
+	DstPort  uint16    // 2 bytes - 目标端口
+	Protocol uint8     // 1 byte  - 协议类型 (TCP/UDP)
+	Family   uint8     // 1 byte  - 地址族 (AF_INET/AF_INET6)
+	State    uint16    // 2 bytes - 连接状态
+	Comm     [16]byte  // 16 bytes - 进程名称
+	// 总计: 48 bytes
+}
+
 // String 格式化显示网络事件
 func (ne *NetworkEvent) String() string {
 	srcIP := intToIP(ne.SrcIP)
