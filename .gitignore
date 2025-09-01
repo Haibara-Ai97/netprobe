@@ -57,4 +57,7 @@ pkg/ebpf/objects/security-monitor.o
 config/local/
 .env
 .env.local
-/ebpf/network/networkmonitor_x86_bpfel.go
+ebpf/network/networkmonitor_x86_bpfel.go
+ebpf/netfilter/netfiltermonitor_x86_bpfel.go
+ebpf/socket/socketmonitor_x86_bpfel.go
+ebpf/vxlan/vxlanmonitor_x86_bpfel.go
