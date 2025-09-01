@@ -39,7 +39,7 @@ func DefaultExporterConfig() *ExporterConfig {
 // Exporter Prometheus metrics 导出器
 type Exporter struct {
 	config           *ExporterConfig
-	ebpfManager      *ebpf.Manager
+	ebpfManager      *ebpf.SimpleEBPFManager
 	collectorManager *collector.Manager
 	metricsServer    *Server
 
@@ -55,7 +55,7 @@ type Exporter struct {
 }
 
 // NewExporter 创建新的 metrics 导出器
-func NewExporter(ebpfManager *ebpf.Manager, config *ExporterConfig) *Exporter {
+func NewExporter(ebpfManager *ebpf.SimpleEBPFManager, config *ExporterConfig) *Exporter {
 	if config == nil {
 		config = DefaultExporterConfig()
 	}

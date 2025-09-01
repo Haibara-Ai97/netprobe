@@ -24,7 +24,7 @@ func TestMain(m *testing.M) {
 
 func TestTCCollector_CollectOnce(t *testing.T) {
 	// 创建 eBPF 管理器
-	ebpfManager := ebpf.NewManager()
+	ebpfManager := ebpf.NewSimpleEBPFManager()
 	defer ebpfManager.Close()
 
 	// 加载 eBPF 程序
@@ -170,7 +170,7 @@ func TestTCCollector_CollectOnce(t *testing.T) {
 }
 
 func TestTCCollector_SetCollectInterval(t *testing.T) {
-	ebpfManager := ebpf.NewManager()
+	ebpfManager := ebpf.NewSimpleEBPFManager()
 	defer ebpfManager.Close()
 
 	tcCollector := NewTCCollector(ebpfManager)
@@ -186,7 +186,7 @@ func TestTCCollector_SetCollectInterval(t *testing.T) {
 
 func TestTCCollector_ErrorHandling(t *testing.T) {
 	// 测试没有初始化网络加载器的 eBPF 管理器
-	ebpfManager := ebpf.NewManager()
+	ebpfManager := ebpf.NewSimpleEBPFManager()
 	defer ebpfManager.Close()
 	
 	tcCollector := NewTCCollector(ebpfManager)

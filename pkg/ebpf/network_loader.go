@@ -209,6 +209,28 @@ func (nl *NetworkLoader) ReadLoadBalancerStats() (*LoadBalancerStats, error) {
 	return stats, iter.Err()
 }
 
+// ReadTCDeviceStats 读取TC设备统计信息
+func (nl *NetworkLoader) ReadTCDeviceStats() (map[TCDeviceKey]uint64, error) {
+	if nl.objs.TcDeviceStats == nil {
+		return nil, fmt.Errorf("TC device stats map is not initialized")
+	}
+
+	stats := make(map[TCDeviceKey]uint64)
+	
+	var key TCDeviceKey
+	var value uint64
+	iter := nl.objs.TcDeviceStats.Iterate()
+	for iter.Next(&key, &value) {
+		stats[key] = value
+	}
+	
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate TC device stats: %w", err)
+	}
+
+	return stats, nil
+}
+
 // 黑名单管理方法
 
 // AddToBlacklist 添加IP到黑名单

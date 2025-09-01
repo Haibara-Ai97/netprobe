@@ -305,6 +305,14 @@ func (m *SimpleEBPFManager) GetAttachedInterface() string {
 	return m.attachedInterface
 }
 
+// GetNetworkLoader 获取网络加载器的引用
+func (m *SimpleEBPFManager) GetNetworkLoader() *NetworkLoader {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	return m.networkLoader
+}
+
 // startStatsReporting 启动统计报告
 func (m *SimpleEBPFManager) startStatsReporting() {
 	if m.config.StatsReportInterval <= 0 {
